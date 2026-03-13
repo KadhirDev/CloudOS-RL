@@ -1,14 +1,10 @@
 import numpy as np
 from typing import Dict, Tuple
 
-from ai_engine.environment.action_decoder import REGIONS  # re-use the list
+from ai_engine.environment.action_decoder import ActionDecoder
 
 
-_REGION_IDX: Dict[str, int] = {r: i for i, r in enumerate([
-    "us-east-1", "us-west-2", "eu-west-1", "eu-central-1",
-    "ap-southeast-1", "ap-northeast-1", "us-central1",
-    "europe-west4", "eastus", "westeurope",
-])}
+_REGION_IDX: Dict[str, int] = {r: i for i, r in enumerate(ActionDecoder.REGIONS)}
 
 BASELINE_COST_PER_HR  = 0.096   # m5.large on-demand us-east-1
 BASELINE_LATENCY_MS   = 200.0

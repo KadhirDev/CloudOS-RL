@@ -113,46 +113,53 @@ class CarbonAPIClient:
         Returns carbon intensity for all 16 mapped AWS regions.
         Always returns a complete non-empty dict regardless of API availability.
         """
-        if not self._api_key:
-            logger.warning(
-                "ELECTRICITY_MAPS_API_KEY not set. "
-                "Using static carbon values (valid for training). "
-                "For live data: set key in .env — free at https://www.electricitymaps.com/free-tier"
+        try:
+            if not self._api_key:
+                logger.warning(
+                    "ELECTRICITY_MAPS_API_KEY not set. "
+                    "Using static carbon values (valid for training). "
+                    "For live data: set key in .env — free at https://www.electricitymaps.com/free-tier"
+                )
+                return self._build_static_all()
+
+            logger.info("CarbonAPIClient: fetching live carbon for %d regions ...", len(AWS_REGION_TO_ZONE))
+            t0 = time.perf_counter()
+
+            results: Dict[str, Dict] = {}
+            failed_regions: List[str] = []
+
+            for aws_region, zone in AWS_REGION_TO_ZONE.items():
+                data, source = self._fetch_zone(zone)
+                if data is not None:
+                    entry = self._format_live_entry(aws_region, zone, data, source)
+                    results[aws_region] = entry
+                    self._cache[aws_region] = entry
+                else:
+                    failed_regions.append(aws_region)
+                time.sleep(_BATCH_PAUSE)
+
+            for region in failed_regions:
+                if region in self._cache:
+                    results[region] = {**self._cache[region], "data_source": "cached_live"}
+                else:
+                    results[region] = self._static_entry(region)
+
+            live = sum(1 for v in results.values() if "live" in v.get("data_source", ""))
+            cached = sum(1 for v in results.values() if "cached" in v.get("data_source", ""))
+            static = sum(1 for v in results.values() if "static" in v.get("data_source", ""))
+            elapsed = (time.perf_counter() - t0) * 1000
+
+            logger.info(
+                "CarbonAPIClient: %d regions — live=%d cached=%d static=%d (%.0f ms)",
+                len(results), live, cached, static, elapsed,
             )
-            return self._build_static_all()
+            return results
 
-        logger.info("CarbonAPIClient: fetching live carbon for %d regions ...", len(AWS_REGION_TO_ZONE))
-        t0 = time.perf_counter()
-
-        results: Dict[str, Dict]  = {}
-        failed_regions: List[str] = []
-
-        for aws_region, zone in AWS_REGION_TO_ZONE.items():
-            data, source = self._fetch_zone(zone)
-            if data is not None:
-                entry = self._format_live_entry(aws_region, zone, data, source)
-                results[aws_region] = entry
-                self._cache[aws_region] = entry
-            else:
-                failed_regions.append(aws_region)
-            time.sleep(_BATCH_PAUSE)
-
-        for region in failed_regions:
-            if region in self._cache:
-                results[region] = {**self._cache[region], "data_source": "cached_live"}
-            else:
-                results[region] = self._static_entry(region)
-
-        live    = sum(1 for v in results.values() if "live"   in v.get("data_source", ""))
-        cached  = sum(1 for v in results.values() if "cached" in v.get("data_source", ""))
-        static  = sum(1 for v in results.values() if "static" in v.get("data_source", ""))
-        elapsed = (time.perf_counter() - t0) * 1000
-
-        logger.info(
-            "CarbonAPIClient: %d regions — live=%d cached=%d static=%d (%.0f ms)",
-            len(results), live, cached, static, elapsed,
-        )
-        return results
+        except Exception as exc:
+            logger.warning(
+                "CarbonAPIClient.fetch failed (%s) — using static fallback", exc
+            )
+            return self._static_fallback()
 
     # -----------------------------------------------------------------------
     # Private: API calls
@@ -250,3 +257,27 @@ class CarbonAPIClient:
 
     def _build_static_all(self) -> Dict[str, Dict]:
         return {region: self._static_entry(region) for region in AWS_REGION_TO_ZONE}
+    def _static_fallback(self) -> dict:
+        """
+        Returns static carbon intensity fallback data for 16 AWS regions.
+        Used when Electricity Maps API key is absent or call fails.
+        eu-north-1 is cleanest at 42 gCO2/kWh.
+        """
+        return {
+            "us-east-1": {"gco2_per_kwh": 415.0, "source": "static"},
+            "us-east-2": {"gco2_per_kwh": 410.0, "source": "static"},
+            "us-west-1": {"gco2_per_kwh": 252.0, "source": "static"},
+            "us-west-2": {"gco2_per_kwh": 192.0, "source": "static"},
+            "eu-west-1": {"gco2_per_kwh": 316.0, "source": "static"},
+            "eu-west-2": {"gco2_per_kwh": 225.0, "source": "static"},
+            "eu-west-3": {"gco2_per_kwh": 58.0, "source": "static"},
+            "eu-central-1": {"gco2_per_kwh": 338.0, "source": "static"},
+            "eu-north-1": {"gco2_per_kwh": 42.0, "source": "static"},
+            "ap-southeast-1": {"gco2_per_kwh": 453.0, "source": "static"},
+            "ap-southeast-2": {"gco2_per_kwh": 610.0, "source": "static"},
+            "ap-northeast-1": {"gco2_per_kwh": 506.0, "source": "static"},
+            "ap-northeast-2": {"gco2_per_kwh": 415.0, "source": "static"},
+            "ap-south-1": {"gco2_per_kwh": 708.0, "source": "static"},
+            "sa-east-1": {"gco2_per_kwh": 136.0, "source": "static"},
+            "ca-central-1": {"gco2_per_kwh": 89.0, "source": "static"},
+        }

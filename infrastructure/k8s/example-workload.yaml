@@ -1,0 +1,92 @@
+# =============================================================================
+# CloudOS-RL Example CloudWorkload CR
+# =============================================================================
+# Submit this to trigger the operator:
+#   kubectl apply -f infrastructure/k8s/example-workload.yaml
+#
+# Watch the operator process it:
+#   kubectl get cloudworkloads -n cloudos-rl -w
+#
+# See the decision:
+#   kubectl describe cloudworkload ml-training-job -n cloudos-rl
+# =============================================================================
+
+---
+# ML training job — spot tolerant, low-carbon preference
+apiVersion: cloudos.ai/v1alpha1
+kind: CloudWorkload
+metadata:
+  name: ml-training-job
+  namespace: cloudos-rl
+  labels:
+    app: cloudos-rl
+    workload-class: training
+spec:
+  workloadType: training
+  priority: 2
+  spotTolerant: true
+  expectedDurationHours: 4.0
+  resources:
+    cpu:    "8"
+    memory: "32Gi"
+    gpu:    1
+    storage: "200Gi"
+    networkBandwidthGbps: 2.0
+  sla:
+    maxLatencyMs: 500
+    tier: standard
+  constraints:
+    maxCarbonGco2PerKwh: 200.0
+    preferredClouds: ["aws", "gcp"]
+
+---
+# Inference workload — latency sensitive, on-demand only
+apiVersion: cloudos.ai/v1alpha1
+kind: CloudWorkload
+metadata:
+  name: inference-api
+  namespace: cloudos-rl
+  labels:
+    app: cloudos-rl
+    workload-class: inference
+spec:
+  workloadType: inference
+  priority: 3
+  spotTolerant: false
+  expectedDurationHours: 720.0
+  resources:
+    cpu:    "4"
+    memory: "8Gi"
+    gpu:    0
+    storage: "50Gi"
+    networkBandwidthGbps: 5.0
+  sla:
+    maxLatencyMs: 50
+    tier: premium
+
+---
+# Batch job — cost optimised, spot tolerant
+apiVersion: cloudos.ai/v1alpha1
+kind: CloudWorkload
+metadata:
+  name: batch-etl-pipeline
+  namespace: cloudos-rl
+  labels:
+    app: cloudos-rl
+    workload-class: batch
+spec:
+  workloadType: batch
+  priority: 1
+  spotTolerant: true
+  expectedDurationHours: 2.0
+  resources:
+    cpu:    "2"
+    memory: "4Gi"
+    gpu:    0
+    storage: "100Gi"
+    networkBandwidthGbps: 1.0
+  sla:
+    maxLatencyMs: 1000
+    tier: best_effort
+  constraints:
+    maxCostPerHr: 0.10

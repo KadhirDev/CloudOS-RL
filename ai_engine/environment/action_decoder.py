@@ -3,7 +3,7 @@ import numpy as np
 
 
 class ActionDecoder:
-    CLOUDS = ["aws", "gcp", "azure", "oci"]
+    CLOUDS = ["aws", "gcp", "azure", "hybrid"]
     REGIONS = [
         "us-east-1", "us-west-2", "eu-west-1", "eu-central-1",
         "ap-southeast-1", "ap-northeast-1", "us-central1",
