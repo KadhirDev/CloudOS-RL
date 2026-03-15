@@ -1,11 +1,8 @@
 # =============================================================================
 # CloudOS-RL Kafka-Prometheus Bridge Deployment
-# Runs Module D bridge inside Minikube.
-# Connects to Kafka at host.minikube.internal:9092 (native Windows Kafka).
-# Exposes /metrics at :9090 inside the cluster.
+# Uses pre-built cloudos-bridge image — no pip install at startup.
 # =============================================================================
 
-# ── Deployment ────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,12 +13,12 @@ metadata:
     app.kubernetes.io/component: bridge
     app:                         cloudos-bridge
 spec:
-  replicas: 1   # bridge is stateful (Kafka consumer group) — keep at 1
+  replicas: 1
   selector:
     matchLabels:
       app: cloudos-bridge
   strategy:
-    type: Recreate   # avoid two consumers in same group simultaneously
+    type: Recreate
   template:
     metadata:
       labels:
@@ -34,7 +31,6 @@ spec:
     spec:
       serviceAccountName: cloudos-operator
 
-      # ── Init container: wait for Kafka to be reachable ───────────────────
       initContainers:
         - name: wait-for-kafka
           image: busybox:1.36
@@ -44,25 +40,15 @@ spec:
             - |
               echo "Waiting for Kafka at host.minikube.internal:9092 ..."
               until nc -z host.minikube.internal 9092; do
-                echo "  Kafka not ready — retrying in 5s"
+                echo "  Not ready — retrying in 5s"
                 sleep 5
               done
-              echo "Kafka is reachable."
+              echo "Kafka ready."
 
       containers:
         - name: bridge
-          # Use the same Python image as the project
-          # Replace with your built image tag when you run: docker build
-          image: python:3.11-slim
-          imagePullPolicy: IfNotPresent
-
-          command:
-            - sh
-            - -c
-            - |
-              pip install --quiet confluent-kafka prometheus-client pyyaml && \
-              cd /app && \
-              python -m ai_engine.kafka.kafka_prometheus_bridge
+          image: cloudos-bridge:latest
+          imagePullPolicy: Never   # local Minikube image
 
           ports:
             - name: metrics
@@ -75,31 +61,15 @@ spec:
                 configMapKeyRef:
                   name: cloudos-config
                   key:  CLOUDOS_KAFKA_BOOTSTRAP
-            - name: BRIDGE_PROMETHEUS_HOST
-              valueFrom:
-                configMapKeyRef:
-                  name: cloudos-config
-                  key:  BRIDGE_PROMETHEUS_HOST
-            - name: BRIDGE_PROMETHEUS_PORT
-              valueFrom:
-                configMapKeyRef:
-                  name: cloudos-config
-                  key:  BRIDGE_PROMETHEUS_PORT
             - name: CLOUDOS_LOG_LEVEL
               valueFrom:
                 configMapKeyRef:
                   name: cloudos-config
                   key:  CLOUDOS_LOG_LEVEL
-            - name: ELECTRICITY_MAPS_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cloudos-secrets
-                  key:  ELECTRICITY_MAPS_API_KEY
-                  optional: true
+            - name: PYTHONPATH
+              value: "/app"
 
           volumeMounts:
-            - name: app-code
-              mountPath: /app
             - name: config
               mountPath: /app/config/settings.yaml
               subPath:   settings.yaml
@@ -116,11 +86,19 @@ spec:
               cpu:    "500m"
               memory: "512Mi"
 
+          startupProbe:
+            httpGet:
+              path: /metrics
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds:       5
+            failureThreshold:    12   # 10 + (12×5) = 70s window
+
           livenessProbe:
             httpGet:
               path: /metrics
               port: 9090
-            initialDelaySeconds: 30
+            initialDelaySeconds: 20
             periodSeconds:       15
             failureThreshold:    3
 
@@ -131,17 +109,12 @@ spec:
             initialDelaySeconds: 15
             periodSeconds:       10
 
-      # ── HostAliases: resolve host.minikube.internal ───────────────────────
-      # Minikube adds this automatically, but explicit is safer
-     
-      volumes:
-        # Project code — mounted from host via Minikube hostPath
-        - name: app-code
-          hostPath:
-            path: /cloudos-rl    # see minikube_setup.ps1 — mounts project root here
-            type: DirectoryOrCreate
+      hostAliases:
+        - ip: "192.168.49.1"
+          hostnames:
+            - "host.minikube.internal"
 
-        # Config from ConfigMap
+      volumes:
         - name: config
           configMap:
             name: cloudos-config
@@ -149,7 +122,6 @@ spec:
               - key:  settings.yaml
                 path: settings.yaml
 
-        # Data directories — persistent across pod restarts
         - name: data-pricing
           hostPath:
             path: /cloudos-rl/data/pricing
@@ -161,8 +133,6 @@ spec:
             type: DirectoryOrCreate
 
 ---
-
-# ── Service: ClusterIP ────────────────────────────────────────────────────────
 apiVersion: v1
 kind: Service
 metadata:

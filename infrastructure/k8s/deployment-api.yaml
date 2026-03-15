@@ -1,10 +1,9 @@
 # =============================================================================
 # CloudOS-RL FastAPI Backend Deployment
-# Skeleton deployment — Module C/H completes the actual API code.
-# Exposes the scheduling REST API at :8000.
+# Uses pre-built cloudos-api image — no pip install at startup.
+# Build image first: .\scripts\build_images.ps1
 # =============================================================================
 
-# ── Deployment ────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -43,26 +42,32 @@ spec:
             - sh
             - -c
             - |
-              echo "Waiting for cloudos-bridge-svc ..."
+              echo "Waiting for cloudos-bridge-svc:9090 ..."
               until wget -qO- http://cloudos-bridge-svc:9090/metrics > /dev/null 2>&1; do
-                echo "  Bridge not ready — retrying in 5s"
+                echo "  Not ready — retrying in 5s"
                 sleep 5
               done
-              echo "Bridge is reachable."
+              echo "Bridge ready."
 
       containers:
         - name: api
-          image: python:3.11-slim
-          imagePullPolicy: IfNotPresent
+          # Pre-built image — all deps already installed
+          image: cloudos-api:latest
+          imagePullPolicy: Never   # use local Minikube image, no registry needed
 
           command:
-            - sh
-            - -c
-            - |
-              pip install --quiet fastapi uvicorn pyyaml pydantic boto3 && \
-              cd /app && \
-              python -m uvicorn backend.api.main:app \
-                --host 0.0.0.0 --port 8000 --workers 2 --log-level info
+            - python
+            - -m
+            - uvicorn
+            - backend.api.main:app
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+            - --workers
+            - "1"
+            - --log-level
+            - info
 
           ports:
             - name: http
@@ -93,57 +98,68 @@ spec:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name: cloudos-secrets
-                  key:  AWS_ACCESS_KEY_ID
+                  name:     cloudos-secrets
+                  key:      AWS_ACCESS_KEY_ID
                   optional: true
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: cloudos-secrets
-                  key:  AWS_SECRET_ACCESS_KEY
+                  name:     cloudos-secrets
+                  key:      AWS_SECRET_ACCESS_KEY
                   optional: true
             - name: AWS_DEFAULT_REGION
               valueFrom:
                 secretKeyRef:
-                  name: cloudos-secrets
-                  key:  AWS_DEFAULT_REGION
+                  name:     cloudos-secrets
+                  key:      AWS_DEFAULT_REGION
                   optional: true
+            - name: PYTHONPATH
+              value: "/app"
 
           volumeMounts:
-            - name: app-code
-              mountPath: /app
-            - name: config
-              mountPath: /app/config/settings.yaml
-              subPath:   settings.yaml
             - name: data-pricing
               mountPath: /app/data/pricing
             - name: data-carbon
               mountPath: /app/data/carbon
             - name: models
               mountPath: /app/models
+            - name: config
+              mountPath: /app/config/settings.yaml
+              subPath:   settings.yaml
 
           resources:
             requests:
               cpu:    "200m"
-              memory: "512Mi"
+              memory: "1Gi"
             limits:
               cpu:    "1000m"
-              memory: "2Gi"
+              memory: "3Gi"
 
-          livenessProbe:
+          # startupProbe: generous window for model loading (SHAP init ~30s)
+          startupProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 40
-            periodSeconds:       20
-            failureThreshold:    3
+            initialDelaySeconds: 15
+            periodSeconds:       10
+            failureThreshold:    18   # 15 + (18×10) = 195s total window
+            successThreshold:    1
 
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 20
+            initialDelaySeconds: 10
             periodSeconds:       10
+            failureThreshold:    3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds:       20
+            failureThreshold:    3
 
       hostAliases:
         - ip: "192.168.49.1"
@@ -151,11 +167,6 @@ spec:
             - "host.minikube.internal"
 
       volumes:
-        - name: app-code
-          hostPath:
-            path: /cloudos-rl
-            type: DirectoryOrCreate
-
         - name: config
           configMap:
             name: cloudos-config
@@ -179,8 +190,6 @@ spec:
             type: DirectoryOrCreate
 
 ---
-
-# ── Service: NodePort (accessible from host browser) ─────────────────────────
 apiVersion: v1
 kind: Service
 metadata:
@@ -196,6 +205,6 @@ spec:
     - name:       http
       port:       8000
       targetPort: 8000
-      nodePort:   30800     # accessible at minikube_ip:30800
+      nodePort:   30800
       protocol:   TCP
   type: NodePort

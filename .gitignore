@@ -48,3 +48,9 @@ models/best/
 # data/carbon/carbon_intensity.json
 # SHAP generated data
 data/shap/
+
+# Training artifacts / model outputs
+models/metrics/
+models/eval_logs/
+models/*.zip
+models/*.pkl
