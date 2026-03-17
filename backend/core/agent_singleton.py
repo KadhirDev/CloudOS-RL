@@ -38,7 +38,6 @@ def _load_config() -> dict:
     else:
         logger.warning("config/settings.yaml not found — using env/default config only")
 
-    # Env vars injected by ConfigMap take precedence over settings.yaml
     model_path = os.environ.get("CLOUDOS_MODEL_PATH", "")
     vecnorm_path = os.environ.get("CLOUDOS_VECNORM_PATH", "")
     kafka_boot = os.environ.get("CLOUDOS_KAFKA_BOOTSTRAP", "")
@@ -65,7 +64,7 @@ def _load_config() -> dict:
     return cfg
 
 
-def _initialise():
+def _initialise() -> None:
     """
     Load the SchedulerAgent and Kafka producer once during API startup.
     """
@@ -76,7 +75,6 @@ def _initialise():
     model_path = config.get("model", {}).get("path", "")
     vecnorm_path = config.get("model", {}).get("vecnorm", "")
 
-    # Resolve model path: append .zip if caller provided path without suffix
     mp = Path(model_path) if model_path else Path("")
     if model_path and mp.suffix == "":
         mp = Path(f"{model_path}.zip")
@@ -92,29 +90,31 @@ def _initialise():
         Path(vecnorm_path).exists() if vecnorm_path else False,
     )
 
-    # Load SchedulerAgent
     try:
         from ai_engine.inference.scheduler_agent import SchedulerAgent
 
         agent = SchedulerAgent.load(
             config=config,
-            model_path=str(mp) if model_path else "",
-            vecnorm_path=vecnorm_path,
-            with_explainer=True,
+            model_path=str(mp) if model_path else None,
+            vecnorm_path=vecnorm_path or None,
+            with_explainer=False,
         )
 
         with _lock:
             _agent = agent
 
         if agent:
-            logger.info("AgentSingleton: SchedulerAgent ready (PPO + SHAP)")
+            shap_ready = getattr(agent, "_explainer", None) is not None
+            logger.info(
+                "AgentSingleton: SchedulerAgent ready (PPO%s)",
+                " + SHAP" if shap_ready else " only; SHAP unavailable",
+            )
         else:
             logger.warning("AgentSingleton: SchedulerAgent.load returned None — heuristic mode")
 
     except Exception as exc:
         logger.error("AgentSingleton: agent load failed: %s", exc, exc_info=True)
 
-    # Load KafkaProducer
     try:
         from ai_engine.kafka.producer import CloudOSProducer
 
@@ -134,7 +134,7 @@ def _initialise():
     logger.info("AgentSingleton: initialisation complete")
 
 
-def startup_initialise():
+def startup_initialise() -> None:
     """
     Called from FastAPI lifespan on startup — runs in background thread.
     """

@@ -10,9 +10,9 @@ metadata:
   name: cloudos-api
   namespace: cloudos-rl
   labels:
-    app.kubernetes.io/name:      cloudos-rl
+    app.kubernetes.io/name: cloudos-rl
     app.kubernetes.io/component: api
-    app:                         cloudos-api
+    app: cloudos-api
 spec:
   replicas: 1
   selector:
@@ -21,17 +21,17 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge:       1
+      maxSurge: 1
       maxUnavailable: 0
   template:
     metadata:
       labels:
-        app:                         cloudos-api
+        app: cloudos-api
         app.kubernetes.io/component: api
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port:   "8000"
-        prometheus.io/path:   "/metrics"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: cloudos-operator
 
@@ -51,9 +51,8 @@ spec:
 
       containers:
         - name: api
-          # Pre-built image — all deps already installed
           image: cloudos-api:latest
-          imagePullPolicy: Never   # use local Minikube image, no registry needed
+          imagePullPolicy: Never
 
           command:
             - python
@@ -75,91 +74,75 @@ spec:
               protocol: TCP
 
           env:
+            - name: CLOUDOS_MODEL_PATH
+              value: "/app/models/best_model.zip"
+            - name: CLOUDOS_VECNORM_PATH
+              value: "/app/models/vec_normalize.pkl"
             - name: CLOUDOS_KAFKA_BOOTSTRAP
               valueFrom:
                 configMapKeyRef:
                   name: cloudos-config
-                  key:  CLOUDOS_KAFKA_BOOTSTRAP
-            - name: CLOUDOS_MODEL_PATH
-              valueFrom:
-                configMapKeyRef:
-                  name: cloudos-config
-                  key:  CLOUDOS_MODEL_PATH
-            - name: CLOUDOS_VECNORM_PATH
-              valueFrom:
-                configMapKeyRef:
-                  name: cloudos-config
-                  key:  CLOUDOS_VECNORM_PATH
+                  key: CLOUDOS_KAFKA_BOOTSTRAP
             - name: CLOUDOS_LOG_LEVEL
-              valueFrom:
-                configMapKeyRef:
-                  name: cloudos-config
-                  key:  CLOUDOS_LOG_LEVEL
+              value: "INFO"
+            - name: PYTHONPATH
+              value: "/app"
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name:     cloudos-secrets
-                  key:      AWS_ACCESS_KEY_ID
+                  name: cloudos-secrets
+                  key: AWS_ACCESS_KEY_ID
                   optional: true
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name:     cloudos-secrets
-                  key:      AWS_SECRET_ACCESS_KEY
+                  name: cloudos-secrets
+                  key: AWS_SECRET_ACCESS_KEY
                   optional: true
-            - name: AWS_DEFAULT_REGION
-              valueFrom:
-                secretKeyRef:
-                  name:     cloudos-secrets
-                  key:      AWS_DEFAULT_REGION
-                  optional: true
-            - name: PYTHONPATH
-              value: "/app"
 
           volumeMounts:
+            - name: models
+              mountPath: /app/models
             - name: data-pricing
               mountPath: /app/data/pricing
             - name: data-carbon
               mountPath: /app/data/carbon
-            - name: models
-              mountPath: /app/models
             - name: config
               mountPath: /app/config/settings.yaml
-              subPath:   settings.yaml
+              subPath: settings.yaml
 
           resources:
             requests:
-              cpu:    "200m"
+              cpu: "200m"
               memory: "1Gi"
             limits:
-              cpu:    "1000m"
+              cpu: "1000m"
               memory: "3Gi"
 
-          # startupProbe: generous window for model loading (SHAP init ~30s)
           startupProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 15
-            periodSeconds:       10
-            failureThreshold:    18   # 15 + (18×10) = 195s total window
-            successThreshold:    1
+            periodSeconds: 10
+            failureThreshold: 18
+            successThreshold: 1
 
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 10
-            periodSeconds:       10
-            failureThreshold:    3
+            periodSeconds: 10
+            failureThreshold: 3
 
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 30
-            periodSeconds:       20
-            failureThreshold:    3
+            periodSeconds: 20
+            failureThreshold: 3
 
       hostAliases:
         - ip: "192.168.49.1"
@@ -167,12 +150,10 @@ spec:
             - "host.minikube.internal"
 
       volumes:
-        - name: config
-          configMap:
-            name: cloudos-config
-            items:
-              - key:  settings.yaml
-                path: settings.yaml
+        - name: models
+          hostPath:
+            path: /cloudos-rl/models
+            type: Directory
 
         - name: data-pricing
           hostPath:
@@ -184,10 +165,12 @@ spec:
             path: /cloudos-rl/data/carbon
             type: DirectoryOrCreate
 
-        - name: models
-          hostPath:
-            path: /cloudos-rl/models
-            type: Directory
+        - name: config
+          configMap:
+            name: cloudos-config
+            items:
+              - key: settings.yaml
+                path: settings.yaml
 
 ---
 apiVersion: v1
@@ -196,15 +179,15 @@ metadata:
   name: cloudos-api-svc
   namespace: cloudos-rl
   labels:
-    app.kubernetes.io/name:      cloudos-rl
+    app.kubernetes.io/name: cloudos-rl
     app.kubernetes.io/component: api
 spec:
   selector:
     app: cloudos-api
   ports:
-    - name:       http
-      port:       8000
+    - name: http
+      port: 8000
       targetPort: 8000
-      nodePort:   30800
-      protocol:   TCP
+      nodePort: 30800
+      protocol: TCP
   type: NodePort

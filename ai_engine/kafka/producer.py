@@ -17,6 +17,7 @@ Compatible with:
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -48,9 +49,19 @@ class CloudOSProducer:
     """
 
     def __init__(self, config: Dict):
-        servers = config.get("kafka", {}).get("bootstrap_servers", "localhost:9092")
+        config = config or {}
+
+        servers = (
+            os.environ.get("CLOUDOS_KAFKA_BOOTSTRAP")
+            or config.get("kafka", {}).get("bootstrap_servers")
+            or "host.minikube.internal:9092"
+        )
         parts = int(config.get("kafka", {}).get("partitions", 3))
         rep = int(config.get("kafka", {}).get("replication", 1))
+
+        self._servers = servers
+
+        logger.info("CloudOSProducer: bootstrap_servers=%s", servers)
 
         self._producer = Producer(
             {
@@ -168,7 +179,7 @@ class CloudOSProducer:
                 value=json.dumps(payload, default=str).encode("utf-8"),
                 on_delivery=self._on_delivery,
             )
-            self._producer.poll(0)  # non-blocking trigger delivery callbacks
+            self._producer.poll(0)
         except KafkaException as exc:
             logger.error("Kafka produce [%s] key=%s: %s", topic, key, exc)
         except BufferError:

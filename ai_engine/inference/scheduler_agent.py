@@ -28,6 +28,7 @@ is missing, the agent still returns decisions without explanations.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import pickle
@@ -64,7 +65,6 @@ class SchedulerAgent:
         self._explainer = explainer
         self._formatter = formatter
 
-        # Lazy imports here to reduce module-level circular import risks
         from ai_engine.environment.action_decoder import ActionDecoder
         from ai_engine.environment.state_builder import StateBuilder
         from ai_engine.cloud_adapter.pricing_cache import PricingCache
@@ -94,11 +94,9 @@ class SchedulerAgent:
           3) config dict
           4) built-in defaults
         """
-
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv
 
-        # Resolve model path
         mp_str = (
             model_path
             or os.environ.get("CLOUDOS_MODEL_PATH", "")
@@ -112,7 +110,6 @@ class SchedulerAgent:
 
         mp = Path(mp_str)
         vp = Path(vp_str)
-
         model_file = mp if mp.suffix else Path(f"{mp}.zip")
 
         logger.info(
@@ -135,15 +132,22 @@ class SchedulerAgent:
             )
             return None
 
-        # Load PPO model
         try:
-            model = PPO.load(str(model_file), device="cpu")
+            custom_objects = {
+                "learning_rate": 0.0003,
+                "lr_schedule": lambda _: 0.0003,
+                "clip_range": lambda _: 0.2,
+            }
+            model = PPO.load(
+                str(model_file),
+                device="cpu",
+                custom_objects=custom_objects,
+            )
             logger.info("SchedulerAgent: PPO loaded from %s", model_file)
         except Exception as exc:
             logger.error("SchedulerAgent: model load failed: %s", exc, exc_info=True)
             return None
 
-        # Load VecNormalize with NumPy pickle compatibility shim
         vec_env = None
         if vp.exists():
             try:
@@ -175,23 +179,16 @@ class SchedulerAgent:
                 )
                 vec_env = None
         else:
-            logger.warning(
-                "SchedulerAgent: %s not found — running unnormalised.",
-                vp,
-            )
+            logger.warning("SchedulerAgent: %s not found — running unnormalised.", vp)
 
-        # Load optional SHAP explainer
         explainer = None
         formatter = None
 
         if with_explainer:
             try:
                 from ai_engine.explainability.shap_explainer import SHAPExplainer
-                from ai_engine.explainability.explanation_formatter import (
-                    ExplanationFormatter,
-                )
+                from ai_engine.explainability.explanation_formatter import ExplanationFormatter
 
-                # Support either .load(...) or direct constructor
                 if hasattr(SHAPExplainer, "load"):
                     explainer = SHAPExplainer.load(
                         model=model,
@@ -214,7 +211,6 @@ class SchedulerAgent:
                 logger.warning(
                     "SchedulerAgent: SHAP init failed (%s) — continuing without explanations.",
                     exc,
-                    exc_info=True,
                 )
                 explainer = None
                 formatter = None
@@ -236,7 +232,6 @@ class SchedulerAgent:
         - numpy 1.x pickles referring to numpy.core.*
         - numpy 2.x pickles referring to numpy._core.*
         """
-        # If running under numpy 2.x, ensure old numpy.core.* aliases exist
         try:
             import numpy.core as _np_core  # noqa: F401
         except ImportError:
@@ -252,7 +247,6 @@ class SchedulerAgent:
                 importlib.import_module("numpy._core.multiarray"),
             )
 
-        # If running under numpy 1.x, ensure new numpy._core.* aliases exist
         try:
             import numpy._core as _np__core  # noqa: F401
         except ImportError:
@@ -310,11 +304,11 @@ class SchedulerAgent:
         workload_dict = self._to_dict(workload)
         logger.debug("SchedulerAgent.schedule: workload=%s", workload_dict)
 
-        state = self._build_state(workload, workload_dict)
+        state = self._build_state(workload_dict)
         state = self._ensure_state_array(state)
 
         norm_state = self._normalise_obs(state)
-        action, raw_action = self._predict(norm_state)
+        action, _raw_action = self._predict(norm_state)
         decoded = self._decode_action(action, workload, workload_dict)
 
         explanation = None
@@ -350,9 +344,6 @@ class SchedulerAgent:
         workload: Any,
         include_explanation: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Alias for schedule() to support alternate call sites.
-        """
         return self.schedule(workload=workload, include_explanation=include_explanation)
 
     def predict_decision(
@@ -360,9 +351,6 @@ class SchedulerAgent:
         workload: Any,
         include_explanation: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Alias for schedule() to support alternate call sites.
-        """
         return self.schedule(workload=workload, include_explanation=include_explanation)
 
     # -------------------------------------------------------------------------
@@ -389,108 +377,127 @@ class SchedulerAgent:
 
         if hasattr(obj, "__dict__"):
             try:
-                return {
-                    k: v
-                    for k, v in vars(obj).items()
-                    if not k.startswith("_")
-                }
+                return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
             except Exception:
                 pass
 
         return {"value": obj}
 
-    def _build_state(self, workload: Any, workload_dict: Dict[str, Any]) -> Any:
+    def _get_pricing(self) -> Dict[str, Any]:
+        pricing: Dict[str, Any] = {}
+
+        if self._pricing_cache is None:
+            return pricing
+
+        for method_name in ("get_current_pricing", "get_pricing"):
+            method = getattr(self._pricing_cache, method_name, None)
+            if callable(method):
+                try:
+                    pricing = method() or {}
+                    break
+                except Exception as exc:
+                    logger.debug("_get_pricing: %s failed (%s)", method_name, exc)
+
+        return pricing
+
+    def _load_carbon(self) -> Dict[str, Any]:
         """
-        Build the observation expected by StateBuilder.build(workload, pricing, carbon, history).
+        Best-effort carbon data loader.
         """
+        carbon: Dict[str, Any] = {}
 
-        # Normalize incoming API payload to what StateBuilder expects
-        normalized_workload = {
-            "cpu_request": workload_dict.get("cpu_request")
-            or workload_dict.get("cpu_request_vcpu")
-            or 1.0,
-            "memory_request_gb": workload_dict.get("memory_request_gb", 2.0),
-            "gpu_count": workload_dict.get("gpu_count", 0),
-            "storage_gb": workload_dict.get("storage_gb", 100.0),
-            "network_bandwidth_gbps": workload_dict.get("network_bandwidth_gbps", 1.0),
-            "expected_duration_hours": workload_dict.get("expected_duration_hours", 1.0),
-            "priority": workload_dict.get("priority", 2),
-            "sla_latency_ms": workload_dict.get("sla_latency_ms", 200.0),
-            "workload_type": (
-                "ml_training"
-                if workload_dict.get("workload_type") in ("training", "ml_training")
-                else workload_dict.get("workload_type", "batch")
-            ),
-            "is_spot_tolerant": workload_dict.get("is_spot_tolerant", False),
-        }
+        path = (
+            self._config.get("data_pipeline", {}).get("carbon_output_path")
+            or self._config.get("environment", {}).get("carbon_output_path")
+            or "data/carbon/carbon_intensity.json"
+        )
 
-        # Pricing data
-        pricing = {}
         try:
-            if hasattr(self._pricing_cache, "get_all"):
-                pricing = self._pricing_cache.get_all() or {}
-            elif hasattr(self._pricing_cache, "load"):
-                pricing = self._pricing_cache.load() or {}
-            elif hasattr(self._pricing_cache, "get_pricing"):
-                pricing = self._pricing_cache.get_pricing() or {}
-            elif hasattr(self._pricing_cache, "data"):
-                pricing = self._pricing_cache.data or {}
-        except Exception as exc:
-            logger.warning(
-                "SchedulerAgent._build_state: pricing load failed (%s) — using empty pricing.",
-                exc,
-                exc_info=True,
-            )
-            pricing = {}
-
-        # Carbon data
-        carbon = {}
-        try:
-            carbon_path = self._config.get("data_pipeline", {}).get(
-                "carbon_output_path",
-                "/app/data/carbon/carbon_intensity.json",
-            )
-            carbon_file = Path(carbon_path)
-            if carbon_file.exists():
-                import json
-                with open(carbon_file, "r", encoding="utf-8") as fh:
+            carbon_path = Path(path)
+            if carbon_path.exists():
+                with open(carbon_path, "r", encoding="utf-8") as fh:
                     carbon = json.load(fh) or {}
         except Exception as exc:
-            logger.warning(
-                "SchedulerAgent._build_state: carbon load failed (%s) — using empty carbon.",
-                exc,
-                exc_info=True,
-            )
-            carbon = {}
+            logger.debug("_load_carbon: failed to load carbon file (%s)", exc)
 
-        # History: safe default for online inference
-        history: List[Dict[str, Any]] = []
+        return carbon
 
-        try:
-            state = self._state_builder.build(
-                normalized_workload,
-                pricing,
-                carbon,
-                history,
-            )
-            logger.info("SchedulerAgent._build_state: using StateBuilder.build")
-            return state
-        except Exception as exc:
-            logger.error(
-                "SchedulerAgent._build_state: StateBuilder.build failed: %s",
-                exc,
-                exc_info=True,
-            )
-            raise
+    def build_state(self, workload: Dict[str, Any]) -> np.ndarray:
+        """
+        Public entry point — builds 45-dim state from workload dict.
+        """
+        return self._build_state(workload)
+
+    def _build_state(self, workload: Dict[str, Any]) -> np.ndarray:
+        """
+        Calls StateBuilder.build(workload, pricing, carbon, history).
+        Falls back carefully across older method signatures.
+        """
+        workload_dict = self._to_dict(workload)
+
+        if "cpu_request_vcpu" in workload_dict and "cpu_request" not in workload_dict:
+            workload_dict["cpu_request"] = workload_dict["cpu_request_vcpu"]
+
+        pricing = self._get_pricing()
+        carbon = self._load_carbon()
+        history: List[Any] = []
+
+        if self._state_builder is not None:
+            try:
+                state = self._state_builder.build(workload_dict, pricing, carbon, history)
+                if isinstance(state, np.ndarray) and state.shape == (45,):
+                    logger.info("SchedulerAgent._build_state: using correct build(...) signature")
+                    return state.astype(np.float32)
+
+                if isinstance(state, np.ndarray):
+                    logger.warning(
+                        "_build_state: build() returned shape %s, expected (45,)",
+                        state.shape,
+                    )
+                    return state.astype(np.float32)
+
+            except TypeError as exc:
+                logger.warning(
+                    "_build_state: build(workload, pricing, carbon, history) failed (%s) — trying fallbacks",
+                    exc,
+                )
+            except Exception as exc:
+                logger.error("SchedulerAgent._build_state: build() failed: %s", exc, exc_info=True)
+                raise
+
+            try:
+                state = self._state_builder.build(workload_dict)
+                if isinstance(state, np.ndarray):
+                    logger.info("SchedulerAgent._build_state: using fallback build(workload)")
+                    return state.astype(np.float32)
+            except TypeError:
+                pass
+            except Exception as exc:
+                logger.warning("_build_state: fallback build(workload) failed (%s)", exc)
+
+            for method_name in ("build_state", "from_workload", "get_state"):
+                method = getattr(self._state_builder, method_name, None)
+                if callable(method):
+                    try:
+                        state = method(workload_dict)
+                        if isinstance(state, np.ndarray):
+                            logger.info("SchedulerAgent._build_state: using fallback %s(...)", method_name)
+                            return state.astype(np.float32)
+                    except Exception:
+                        continue
+
+        logger.error(
+            "SchedulerAgent: no compatible StateBuilder method found. Available methods: %s",
+            [m for m in dir(self._state_builder) if not m.startswith("_")]
+            if self._state_builder
+            else "state_builder=None",
+        )
+        return np.zeros(45, dtype=np.float32)
 
     def _ensure_state_array(self, state: Any) -> np.ndarray:
         arr = np.asarray(state, dtype=np.float32)
-
-        # PPO predict usually expects shape (obs_dim,) for non-vectorized direct call
-        # or (1, obs_dim) depending on wrapper. Keep as 1D for model.predict.
         if arr.ndim > 1:
             arr = arr.reshape(-1)
-
         return arr
 
     def _normalise_obs(self, state: np.ndarray) -> np.ndarray:
@@ -498,7 +505,6 @@ class SchedulerAgent:
             return state
 
         try:
-            # VecNormalize.normalize_obs expects batch shape
             batched = np.asarray([state], dtype=np.float32)
             normed = self._vec_env.normalize_obs(batched)
 
@@ -521,13 +527,13 @@ class SchedulerAgent:
             raise RuntimeError("SchedulerAgent: model not loaded")
 
         try:
-            action, _state = self._model.predict(obs, deterministic=True)
+            action, state = self._model.predict(obs, deterministic=True)
         except Exception as exc:
             logger.error("SchedulerAgent: PPO.predict failed: %s", exc, exc_info=True)
             raise
 
         action_list = self._as_action_list(action)
-        return action_list, action
+        return action_list, state
 
     def _as_action_list(self, action: Any) -> List[int]:
         if isinstance(action, np.ndarray):
@@ -545,10 +551,6 @@ class SchedulerAgent:
         workload: Any,
         workload_dict: Dict[str, Any],
     ) -> Any:
-        """
-        Try several possible ActionDecoder signatures to stay compatible
-        with your project’s implementation.
-        """
         candidates = [
             ("decode", (action,)),
             ("decode", (action, workload)),
@@ -676,223 +678,7 @@ class SchedulerAgent:
                 base = {"decision": str(decoded)}
         elif hasattr(decoded, "__dict__"):
             try:
-                base = {
-                    k: v
-                    for k, v in vars(decoded).items()
-                    if not k.startswith("_")
-                }
-            except Exception:
-                base = {"decision": str(decoded)}
-        else:
-            base = {"decision": decoded}
-
-        base.setdefault("workload", workload_dict)
-        base.setdefault("action", action)
-        base["inference_ms"] = duration_ms
-
-        if explanation is not None:
-            base["explanation"] = explanation
-
-        return base
-
-    def _ensure_state_array(self, state: Any) -> np.ndarray:
-        arr = np.asarray(state, dtype=np.float32)
-
-        # PPO predict usually expects shape (obs_dim,) for non-vectorized direct call
-        # or (1, obs_dim) depending on wrapper. Keep as 1D for model.predict.
-        if arr.ndim > 1:
-            arr = arr.reshape(-1)
-
-        return arr
-
-    def _normalise_obs(self, state: np.ndarray) -> np.ndarray:
-        if self._vec_env is None:
-            return state
-
-        try:
-            # VecNormalize.normalize_obs expects batch shape
-            batched = np.asarray([state], dtype=np.float32)
-            normed = self._vec_env.normalize_obs(batched)
-
-            if isinstance(normed, np.ndarray):
-                if normed.ndim >= 2:
-                    return normed[0].astype(np.float32)
-                return normed.astype(np.float32)
-
-            return state
-        except Exception as exc:
-            logger.warning(
-                "SchedulerAgent: observation normalization failed (%s) — using raw state.",
-                exc,
-                exc_info=True,
-            )
-            return state
-
-    def _predict(self, obs: np.ndarray) -> Tuple[List[int], Any]:
-        if self._model is None:
-            raise RuntimeError("SchedulerAgent: model not loaded")
-
-        try:
-            action, _state = self._model.predict(obs, deterministic=True)
-        except Exception as exc:
-            logger.error("SchedulerAgent: PPO.predict failed: %s", exc, exc_info=True)
-            raise
-
-        action_list = self._as_action_list(action)
-        return action_list, action
-
-    def _as_action_list(self, action: Any) -> List[int]:
-        if isinstance(action, np.ndarray):
-            flat = action.reshape(-1).tolist()
-            return [int(x) for x in flat]
-
-        if isinstance(action, (list, tuple)):
-            return [int(x) for x in action]
-
-        return [int(action)]
-
-    def _decode_action(
-        self,
-        action: List[int],
-        workload: Any,
-        workload_dict: Dict[str, Any],
-    ) -> Any:
-        """
-        Try several possible ActionDecoder signatures to stay compatible
-        with your project’s implementation.
-        """
-        candidates = [
-            ("decode", (action,)),
-            ("decode", (action, workload)),
-            ("decode", (action, workload_dict)),
-            ("decode_action", (action,)),
-            ("decode_action", (action, workload)),
-            ("decode_action", (action, workload_dict)),
-        ]
-
-        for method_name, args in candidates:
-            method = getattr(self._decoder, method_name, None)
-            if callable(method):
-                try:
-                    decoded = method(*args)
-                    logger.debug(
-                        "SchedulerAgent._decode_action: used ActionDecoder.%s",
-                        method_name,
-                    )
-                    return decoded
-                except TypeError:
-                    continue
-
-        logger.warning(
-            "SchedulerAgent: no compatible ActionDecoder method found; returning raw action wrapper."
-        )
-        return {"action": action}
-
-    def _build_explanation(
-        self,
-        raw_state: np.ndarray,
-        norm_state: np.ndarray,
-        action: List[int],
-        decoded: Any,
-        workload: Any,
-        workload_dict: Dict[str, Any],
-    ) -> Optional[Any]:
-        if self._explainer is None:
-            return None
-
-        shap_result = None
-
-        explain_candidates = [
-            ("explain", (), {"state": norm_state}),
-            ("explain", (), {"state": raw_state}),
-            ("explain", (), {"observation": norm_state}),
-            ("explain", (), {"observation": raw_state}),
-            ("explain", (), {"obs": norm_state}),
-            ("explain", (), {"obs": raw_state}),
-            ("explain", (norm_state,), {}),
-            ("explain", (raw_state,), {}),
-        ]
-
-        for method_name, args, kwargs in explain_candidates:
-            method = getattr(self._explainer, method_name, None)
-            if callable(method):
-                try:
-                    shap_result = method(*args, **kwargs)
-                    break
-                except TypeError:
-                    continue
-                except Exception as exc:
-                    logger.warning(
-                        "SchedulerAgent: explainer.%s failed (%s)",
-                        method_name,
-                        exc,
-                        exc_info=True,
-                    )
-                    shap_result = None
-                    break
-
-        if shap_result is None:
-            return None
-
-        if self._formatter is None:
-            return shap_result
-
-        format_candidates = [
-            ("format", (), {"explanation": shap_result, "decision": decoded, "workload": workload_dict}),
-            ("format", (), {"explanation": shap_result, "decision": decoded}),
-            ("format", (shap_result,), {}),
-        ]
-
-        for method_name, args, kwargs in format_candidates:
-            method = getattr(self._formatter, method_name, None)
-            if callable(method):
-                try:
-                    return method(*args, **kwargs)
-                except TypeError:
-                    continue
-                except Exception as exc:
-                    logger.warning(
-                        "SchedulerAgent: formatter.%s failed (%s)",
-                        method_name,
-                        exc,
-                        exc_info=True,
-                    )
-                    return shap_result
-
-        return shap_result
-
-    def _merge_decision_output(
-        self,
-        decoded: Any,
-        workload_dict: Dict[str, Any],
-        action: List[int],
-        explanation: Any,
-        duration_ms: float,
-    ) -> Dict[str, Any]:
-        """
-        Normalize the final result into a dict that API / Kafka can serialize.
-        """
-        base: Dict[str, Any]
-
-        if isinstance(decoded, dict):
-            base = dict(decoded)
-        elif hasattr(decoded, "model_dump"):
-            try:
-                base = decoded.model_dump()
-            except Exception:
-                base = {"decision": str(decoded)}
-        elif hasattr(decoded, "dict"):
-            try:
-                base = decoded.dict()
-            except Exception:
-                base = {"decision": str(decoded)}
-        elif hasattr(decoded, "__dict__"):
-            try:
-                base = {
-                    k: v
-                    for k, v in vars(decoded).items()
-                    if not k.startswith("_")
-                }
+                base = {k: v for k, v in vars(decoded).items() if not k.startswith("_")}
             except Exception:
                 base = {"decision": str(decoded)}
         else:
@@ -911,9 +697,6 @@ class SchedulerAgent:
     # Convenience API
     # -------------------------------------------------------------------------
     def warmup(self) -> None:
-        """
-        Optional light-touch warmup hook.
-        """
         try:
             dummy = np.zeros(45, dtype=np.float32)
             _ = self._normalise_obs(dummy)

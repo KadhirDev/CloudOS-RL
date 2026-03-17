@@ -11,7 +11,7 @@ GET  /api/v1/status         — agent status (model loaded, SHAP ready, last dec
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import yaml
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -34,6 +34,16 @@ router = APIRouter(prefix="/api/v1", tags=["scheduling"])
 # Module-level decision store (in-memory ring buffer, last 1000 decisions)
 _decision_store = DecisionStore(max_size=1000)
 
+# Integer -> label mapping for model/action output
+SLA_TIER_MAP = {
+    0: "best_effort",
+    1: "bronze",
+    2: "silver",
+    3: "gold",
+    4: "platinum",
+    5: "critical",
+}
+
 
 # =============================================================================
 # Internal helpers
@@ -50,6 +60,69 @@ def _load_config() -> dict:
     except Exception as exc:
         logger.warning("Failed to load config/settings.yaml: %s", exc)
         return {}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert value to float safely."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    """Convert value to string safely."""
+    if value is None:
+        return default
+    return str(value)
+
+
+def _normalize_sla_tier(value: Any) -> str:
+    """Normalize SLA tier from int/model output into API string."""
+    if value is None:
+        return "standard"
+    if isinstance(value, int):
+        return SLA_TIER_MAP.get(value, "standard")
+    if isinstance(value, float) and value.is_integer():
+        return SLA_TIER_MAP.get(int(value), "standard")
+    return str(value)
+
+
+def _to_scheduling_decision(
+    raw: Dict[str, Any],
+    *,
+    workload_id: str,
+    decision_id: str,
+    latency_ms: float,
+) -> SchedulingDecision:
+    """
+    Convert raw scheduler/operator output into the API response model safely.
+
+    This prevents pydantic validation crashes when the RL agent returns:
+    - sla_tier as int instead of string
+    - missing estimated_cost_per_hr / savings fields
+    - missing explanation
+    """
+    raw = raw or {}
+
+    return SchedulingDecision(
+        decision_id=_safe_str(raw.get("decision_id", decision_id), decision_id),
+        workload_id=_safe_str(raw.get("workload_id", workload_id), workload_id),
+        cloud=_safe_str(raw.get("cloud", "unknown"), "unknown"),
+        region=_safe_str(raw.get("region", "unknown"), "unknown"),
+        instance_type=_safe_str(raw.get("instance_type", "unknown"), "unknown"),
+        scaling_action=_safe_str(raw.get("scaling_action", "none"), "none"),
+        purchase_option=_safe_str(raw.get("purchase_option", "on_demand"), "on_demand"),
+        sla_tier=_normalize_sla_tier(raw.get("sla_tier", "standard")),
+        estimated_cost_per_hr=_safe_float(raw.get("estimated_cost_per_hr", 0.0), 0.0),
+        cost_savings_pct=_safe_float(raw.get("cost_savings_pct", 0.0), 0.0),
+        carbon_savings_pct=_safe_float(raw.get("carbon_savings_pct", 0.0), 0.0),
+        latency_ms=_safe_float(raw.get("latency_ms", latency_ms), latency_ms),
+        explanation=raw.get("explanation") or {},
+        actual_reward=raw.get("actual_reward"),
+    )
 
 
 def _heuristic_fallback_decision(request: WorkloadRequest) -> SchedulingDecision:
@@ -74,14 +147,21 @@ def _heuristic_fallback_decision(request: WorkloadRequest) -> SchedulingDecision
         or workload.get("workload_id")
         or "api-fallback"
     )
+    fallback_decision_id = str(uuid.uuid4())
+
     workload["workload_id"] = fallback_workload_id
 
-    raw = op._heuristic_decision(workload)
-    raw["decision_id"] = str(uuid.uuid4())
-    raw["latency_ms"] = 1.0
+    raw = op._heuristic_decision(workload) or {}
+    raw["decision_id"] = fallback_decision_id
     raw["workload_id"] = fallback_workload_id
+    raw["latency_ms"] = 1.0
 
-    return SchedulingDecision(**raw)
+    return _to_scheduling_decision(
+        raw,
+        workload_id=fallback_workload_id,
+        decision_id=fallback_decision_id,
+        latency_ms=1.0,
+    )
 
 
 # =============================================================================
@@ -122,12 +202,17 @@ async def schedule_workload(
     decision_id = str(uuid.uuid4())
 
     workload = request.to_agent_dict()
-    workload["workload_id"] = decision_id
+    workload_id = getattr(request, "workload_id", None) or decision_id
+    workload["workload_id"] = workload_id
 
     try:
-        raw = agent.decide(workload)
+        # Keep compatibility with either decide(...) or schedule(...)
+        if hasattr(agent, "decide"):
+            raw = agent.decide(workload)
+        else:
+            raw = agent.schedule(workload)
     except Exception as exc:
-        logger.error("SchedulerAgent.decide failed: %s", exc, exc_info=True)
+        logger.error("SchedulerAgent inference failed: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"RL inference error: {str(exc)[:200]}",
@@ -139,13 +224,18 @@ async def schedule_workload(
             detail="Agent returned no decision. Model may be uninitialised.",
         )
 
-    total_latency_ms = (time.perf_counter() - t0) * 1000
-    raw["decision_id"] = decision_id
-    raw["latency_ms"] = round(total_latency_ms, 2)
+    total_latency_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    decision = SchedulingDecision(
-        **raw,
-        workload_id=getattr(request, "workload_id", None) or decision_id,
+    raw = dict(raw)
+    raw["decision_id"] = decision_id
+    raw["workload_id"] = workload_id
+    raw["latency_ms"] = total_latency_ms
+
+    decision = _to_scheduling_decision(
+        raw,
+        workload_id=workload_id,
+        decision_id=decision_id,
+        latency_ms=total_latency_ms,
     )
 
     background_tasks.add_task(
@@ -158,13 +248,13 @@ async def schedule_workload(
 
     logger.info(
         "Decision %s: %s/%s %s cost=%.4f/hr savings=%.1f%% %.0fms",
-        decision_id[:8],
+        decision.decision_id[:8],
         decision.cloud,
         decision.region,
         decision.purchase_option,
         decision.estimated_cost_per_hr,
         decision.cost_savings_pct,
-        total_latency_ms,
+        decision.latency_ms,
     )
 
     return decision
@@ -207,17 +297,32 @@ async def schedule_batch(
                 )
                 continue
 
+            item_t0 = time.perf_counter()
             workload = wl_req.to_agent_dict()
-            workload["workload_id"] = str(uuid.uuid4())
+            decision_id = str(uuid.uuid4())
+            workload_id = getattr(wl_req, "workload_id", None) or f"batch-{i}"
+            workload["workload_id"] = workload_id
 
-            raw = agent.decide(workload)
+            if hasattr(agent, "decide"):
+                raw = agent.decide(workload)
+            else:
+                raw = agent.schedule(workload)
+
             if raw:
-                raw["decision_id"] = workload["workload_id"]
-                d = SchedulingDecision(
-                    **raw,
-                    workload_id=getattr(wl_req, "workload_id", None) or f"batch-{i}",
+                item_latency_ms = round((time.perf_counter() - item_t0) * 1000, 2)
+                raw = dict(raw)
+                raw["decision_id"] = decision_id
+                raw["workload_id"] = workload_id
+                raw["latency_ms"] = item_latency_ms
+
+                d = _to_scheduling_decision(
+                    raw,
+                    workload_id=workload_id,
+                    decision_id=decision_id,
+                    latency_ms=item_latency_ms,
                 )
                 decisions.append(d)
+
                 background_tasks.add_task(
                     _publish_and_store,
                     producer,
@@ -233,6 +338,7 @@ async def schedule_batch(
                     }
                 )
         except Exception as exc:
+            logger.error("Batch scheduling failed for index %s: %s", i, exc, exc_info=True)
             errors.append({"index": i, "error": str(exc)[:200]})
 
     return BatchSchedulingResponse(
@@ -317,6 +423,7 @@ async def agent_status(agent=Depends(get_agent)) -> AgentStatusResponse:
 async def _publish_and_store(producer, decision, workload, store):
     """Non-blocking: publish to Kafka and store in ring buffer."""
     store.put(decision)
+
     if producer is not None:
         try:
             producer.publish_decision(

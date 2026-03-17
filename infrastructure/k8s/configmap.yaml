@@ -8,31 +8,31 @@ metadata:
   name: cloudos-config
   namespace: cloudos-rl
   labels:
-    app.kubernetes.io/name:      cloudos-rl
+    app.kubernetes.io/name: cloudos-rl
     app.kubernetes.io/component: config
 data:
   # ── Core settings (injected as env vars) ─────────────────────────────────
-  CLOUDOS_AWS_REGION:          "us-east-1"
+  CLOUDOS_AWS_REGION: "us-east-1"
+
   CLOUDOS_MODEL_PATH: "/app/models/best_model.zip"
-  CLOUDOS_VECNORM_PATH:        "/app/models/vec_normalize.pkl"
-  CLOUDOS_LOG_LEVEL:           "INFO"
+  CLOUDOS_VECNORM_PATH: "/app/models/vec_normalize.pkl"
 
-  # Kafka — points to host running natively on Windows
-  # host.minikube.internal resolves to the Windows host from inside Minikube
-  CLOUDOS_KAFKA_BOOTSTRAP: host.docker.internal:9092
+  CLOUDOS_LOG_LEVEL: "INFO"
 
-  # Prometheus — Minikube pods cannot reach localhost:9091 directly
-  # They must use host.minikube.internal
-  PROMETHEUS_URL:              "http://host.minikube.internal:9091"
+  # Kafka — FIXED (important ⚠)
+  CLOUDOS_KAFKA_BOOTSTRAP: host.minikube.internal:9092
+
+  # Prometheus
+  PROMETHEUS_URL: "http://host.minikube.internal:9091"
 
   # Data paths inside the container
-  PRICING_OUTPUT_PATH:         "/app/data/pricing/aws_pricing.json"
-  CARBON_OUTPUT_PATH:          "/app/data/carbon/carbon_intensity.json"
-  ACTUAL_COSTS_OUTPUT_PATH:    "/app/data/pricing/aws_actual_costs.json"
+  PRICING_OUTPUT_PATH: "/app/data/pricing/aws_pricing.json"
+  CARBON_OUTPUT_PATH: "/app/data/carbon/carbon_intensity.json"
+  ACTUAL_COSTS_OUTPUT_PATH: "/app/data/pricing/aws_actual_costs.json"
 
   # Bridge prometheus server (inside pod, not host)
-  BRIDGE_PROMETHEUS_HOST:      "0.0.0.0"
-  BRIDGE_PROMETHEUS_PORT:      "9090"
+  BRIDGE_PROMETHEUS_HOST: "0.0.0.0"
+  BRIDGE_PROMETHEUS_PORT: "9090"
 
   # ── settings.yaml mounted as a file ──────────────────────────────────────
   settings.yaml: |
@@ -43,7 +43,7 @@ data:
       pricing_refresh_sec: 3600
 
     kafka:
-      bootstrap_servers: host.docker.internal:9092
+      bootstrap_servers: host.minikube.internal:9092
       group_id: cloudos-rl-k8s
       topics:
         decisions:    cloudos.scheduling.decisions
@@ -71,12 +71,12 @@ data:
       anomaly_threshold_pct:      50.0
 
     model:
-      path:       /app/models/best_model.zip
-      vecnorm:    /app/models/vec_normalize.pkl
+      path:    /app/models/best_model.zip
+      vecnorm: /app/models/vec_normalize.pkl
 
     environment_config:
       max_episode_steps: 500
-      n_envs:            4
+      n_envs: 4
 
     api:
       host: 0.0.0.0

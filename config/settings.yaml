@@ -3,6 +3,10 @@ app:
   version: 1.0.0
   debug: false
 
+model:
+  path: /app/models/best_model.zip
+  vecnorm: /app/models/vec_normalize.pkl
+
 api:
   host: 0.0.0.0
   port: 8000
@@ -79,3 +83,4 @@ aws:
 
 logging:
   level: INFO
+
