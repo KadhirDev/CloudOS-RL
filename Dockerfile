@@ -28,7 +28,10 @@ RUN pip install --no-cache-dir \
         prometheus-client==0.20.0 \
         confluent-kafka==2.3.0
 
-# Layer 2: scientific stack (larger, changes rarely)
+# Layer 2: scientific stack
+# Keep NumPy 2.x because the current model/vecnorm artifacts were loading
+# successfully with NumPy 2 in your container, while NumPy 1.26.4 caused
+# model deserialization failure in this project.
 RUN pip install --no-cache-dir \
         "numpy>=2.0.0,<2.2.0" \
         scipy==1.13.0 \
@@ -43,9 +46,10 @@ RUN pip install --no-cache-dir \
         gymnasium==0.29.1 \
         stable-baselines3==2.3.0
 
-# Layer 4: SHAP (depends on scipy/numpy — own layer)
+# Layer 4: SHAP
+# SHAP 0.46.0 adds NumPy 2 support; 0.45.0 was the incompatible version in logs.
 RUN pip install --no-cache-dir \
-        shap==0.45.0
+        shap==0.46.0
 
 # ── Application code ──────────────────────────────────────────────────────────
 WORKDIR /app

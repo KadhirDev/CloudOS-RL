@@ -51,6 +51,72 @@ class SchedulerAgent:
     Loads model once, serves many requests, with optional SHAP explanations.
     """
 
+    # -------------------------------------------------------------------------
+    # Static fallback maps for pricing / carbon estimation
+    # -------------------------------------------------------------------------
+    _STATIC_ON_DEMAND: Dict[str, float] = {
+        # AWS
+        "us-east-1": 0.096,
+        "us-east-2": 0.096,
+        "us-west-1": 0.115,
+        "us-west-2": 0.096,
+        "eu-west-1": 0.107,
+        "eu-west-2": 0.113,
+        "eu-west-3": 0.113,
+        "eu-central-1": 0.111,
+        "eu-north-1": 0.098,
+        "ap-southeast-1": 0.114,
+        "ap-southeast-2": 0.121,
+        "ap-northeast-1": 0.118,
+        "ap-northeast-2": 0.114,
+        "ap-south-1": 0.115,
+        "sa-east-1": 0.139,
+        "ca-central-1": 0.100,
+        # GCP
+        "us-central1": 0.096,
+        "europe-west4": 0.107,
+        "asia-southeast1": 0.114,
+        # Azure
+        "eastus": 0.096,
+        "eastasia": 0.121,
+        "westeurope": 0.107,
+        "westus2": 0.096,
+    }
+
+    _STATIC_CARBON: Dict[str, float] = {
+        # AWS
+        "us-east-1": 415.0,
+        "us-east-2": 410.0,
+        "us-west-1": 252.0,
+        "us-west-2": 192.0,
+        "eu-west-1": 316.0,
+        "eu-west-2": 225.0,
+        "eu-west-3": 58.0,
+        "eu-central-1": 338.0,
+        "eu-north-1": 42.0,
+        "ap-southeast-1": 453.0,
+        "ap-southeast-2": 610.0,
+        "ap-northeast-1": 506.0,
+        "ap-northeast-2": 415.0,
+        "ap-south-1": 708.0,
+        "sa-east-1": 136.0,
+        "ca-central-1": 89.0,
+        # GCP
+        "us-central1": 360.0,
+        "europe-west4": 284.0,
+        "asia-southeast1": 453.0,
+        # Azure
+        "eastus": 400.0,
+        "eastasia": 506.0,
+        "westeurope": 290.0,
+        "westus2": 220.0,
+    }
+
+    _SPOT_DISCOUNT: float = 0.65
+    _RESERVED_1YR: float = 0.60
+    _RESERVED_3YR: float = 0.40
+    _BASELINE_REGION: str = "us-east-1"
+
     def __init__(
         self,
         model: Any,
@@ -133,6 +199,8 @@ class SchedulerAgent:
             return None
 
         try:
+            cls._install_numpy_pickle_compat()
+
             custom_objects = {
                 "learning_rate": 0.0003,
                 "lr_schedule": lambda _: 0.0003,
@@ -228,39 +296,57 @@ class SchedulerAgent:
         """
         Install compatibility aliases for NumPy pickle module paths.
 
-        Handles both directions:
-        - numpy 1.x pickles referring to numpy.core.*
-        - numpy 2.x pickles referring to numpy._core.*
+        This helps when serialized SB3/PPO or VecNormalize artifacts were created
+        with a different NumPy major/minor version that referenced either:
+        - numpy.core.*
+        - numpy._core.*
+
+        The shim is safe: it only populates sys.modules aliases when missing.
         """
         try:
-            import numpy.core as _np_core  # noqa: F401
-        except ImportError:
-            import numpy._core as _np__core  # type: ignore
-
-            sys.modules.setdefault("numpy.core", _np__core)
-            sys.modules.setdefault(
-                "numpy.core.numeric",
-                importlib.import_module("numpy._core.numeric"),
-            )
-            sys.modules.setdefault(
-                "numpy.core.multiarray",
-                importlib.import_module("numpy._core.multiarray"),
-            )
+            core_mod = importlib.import_module("numpy.core")
+        except Exception:
+            core_mod = None
 
         try:
-            import numpy._core as _np__core  # noqa: F401
-        except ImportError:
-            import numpy.core as _np_core  # type: ignore
+            underscore_core_mod = importlib.import_module("numpy._core")
+        except Exception:
+            underscore_core_mod = None
 
-            sys.modules.setdefault("numpy._core", _np_core)
-            sys.modules.setdefault(
-                "numpy._core.numeric",
-                importlib.import_module("numpy.core.numeric"),
-            )
-            sys.modules.setdefault(
-                "numpy._core.multiarray",
-                importlib.import_module("numpy.core.multiarray"),
-            )
+        if core_mod is not None and underscore_core_mod is None:
+            sys.modules.setdefault("numpy._core", core_mod)
+            underscore_core_mod = core_mod
+
+        if underscore_core_mod is not None and core_mod is None:
+            sys.modules.setdefault("numpy.core", underscore_core_mod)
+            core_mod = underscore_core_mod
+
+        submodule_pairs = [
+            ("numpy.core.numeric", "numpy._core.numeric"),
+            ("numpy.core.multiarray", "numpy._core.multiarray"),
+            ("numpy.core.umath", "numpy._core.umath"),
+            ("numpy.core._multiarray_umath", "numpy._core._multiarray_umath"),
+        ]
+
+        for public_name, private_name in submodule_pairs:
+            public_mod = None
+            private_mod = None
+
+            try:
+                public_mod = importlib.import_module(public_name)
+            except Exception:
+                public_mod = None
+
+            try:
+                private_mod = importlib.import_module(private_name)
+            except Exception:
+                private_mod = None
+
+            if public_mod is not None and private_mod is None:
+                sys.modules.setdefault(private_name, public_mod)
+
+            if private_mod is not None and public_mod is None:
+                sys.modules.setdefault(public_name, private_mod)
 
     # -------------------------------------------------------------------------
     # Public status helpers
@@ -286,6 +372,88 @@ class SchedulerAgent:
 
     def has_explainer(self) -> bool:
         return self._explainer is not None
+
+    # -------------------------------------------------------------------------
+    # Cost / carbon helper methods
+    # -------------------------------------------------------------------------
+    def _od_price_for_region(self, region: str) -> float:
+        """Returns on-demand $/hr, trying PricingCache first then static table."""
+        region = str(region or self._BASELINE_REGION)
+
+        try:
+            if self._pricing_cache is not None:
+                flat = self._get_pricing()
+                if flat:
+                    if region in flat:
+                        price = float(flat[region])
+                        if price > 0:
+                            return price
+
+                    baseline = flat.get(self._BASELINE_REGION)
+                    if baseline is not None:
+                        price = float(baseline)
+                        if price > 0:
+                            return price
+        except Exception:
+            pass
+
+        return self._STATIC_ON_DEMAND.get(region, self._STATIC_ON_DEMAND[self._BASELINE_REGION])
+
+    def _carbon_for_region(self, region: str) -> float:
+        """Returns gCO2/kWh, trying pipeline file first then static table."""
+        region = str(region or self._BASELINE_REGION)
+
+        try:
+            carbon = self._load_carbon()
+            if carbon:
+                if region in carbon:
+                    val = carbon[region]
+                    parsed = float(val.get("gco2_per_kwh", val) if isinstance(val, dict) else val)
+                    if parsed > 0:
+                        return parsed
+
+                if self._BASELINE_REGION in carbon:
+                    val = carbon[self._BASELINE_REGION]
+                    parsed = float(val.get("gco2_per_kwh", val) if isinstance(val, dict) else val)
+                    if parsed > 0:
+                        return parsed
+        except Exception:
+            pass
+
+        return self._STATIC_CARBON.get(region, self._STATIC_CARBON[self._BASELINE_REGION])
+
+    def estimate_cost_per_hr(self, decoded: Dict[str, Any]) -> float:
+        region = str(decoded.get("region", self._BASELINE_REGION))
+        purchase = str(decoded.get("purchase_option", "on_demand")).lower()
+        od = self._od_price_for_region(region)
+
+        if purchase in {"spot", "preemptible"}:
+            return round(od * (1.0 - self._SPOT_DISCOUNT), 6)
+        if purchase == "reserved_1yr":
+            return round(od * self._RESERVED_1YR, 6)
+        if purchase == "reserved_3yr":
+            return round(od * self._RESERVED_3YR, 6)
+
+        return round(od, 6)
+
+    def cost_savings_pct(self, decoded: Dict[str, Any]) -> float:
+        baseline = self._od_price_for_region(self._BASELINE_REGION)
+        actual = self.estimate_cost_per_hr(decoded)
+
+        if baseline <= 0:
+            return 0.0
+
+        return round(max(0.0, (1.0 - actual / baseline) * 100.0), 2)
+
+    def carbon_savings_pct(self, decoded: Dict[str, Any]) -> float:
+        region = str(decoded.get("region", self._BASELINE_REGION))
+        actual = self._carbon_for_region(region)
+        baseline = self._carbon_for_region(self._BASELINE_REGION)
+
+        if baseline <= 0:
+            return 0.0
+
+        return round(max(0.0, (1.0 - actual / baseline) * 100.0), 2)
 
     # -------------------------------------------------------------------------
     # Core inference
@@ -687,6 +855,19 @@ class SchedulerAgent:
         base.setdefault("workload", workload_dict)
         base.setdefault("action", action)
         base["inference_ms"] = duration_ms
+
+        # Populate business metrics if missing or zero-like
+        estimated = base.get("estimated_cost_per_hr")
+        if estimated in (None, "", 0, 0.0):
+            base["estimated_cost_per_hr"] = self.estimate_cost_per_hr(base)
+
+        cost_savings = base.get("cost_savings_pct")
+        if cost_savings in (None, "", 0, 0.0):
+            base["cost_savings_pct"] = self.cost_savings_pct(base)
+
+        carbon_savings = base.get("carbon_savings_pct")
+        if carbon_savings in (None, "", 0, 0.0):
+            base["carbon_savings_pct"] = self.carbon_savings_pct(base)
 
         if explanation is not None:
             base["explanation"] = explanation

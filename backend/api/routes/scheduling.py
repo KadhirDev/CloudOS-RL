@@ -400,13 +400,18 @@ async def get_decision(decision_id: str) -> SchedulingDecision:
 )
 async def agent_status(agent=Depends(get_agent)) -> AgentStatusResponse:
     last = _decision_store.last()
+
+    explainer = getattr(agent, "_explainer", None) if agent else None
+    config = getattr(agent, "_config", {}) if agent else {}
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+
     return AgentStatusResponse(
         agent_loaded=agent is not None,
-        model_path=str(agent._config.get("model", {}).get("path", "")) if agent else "",
-        shap_ready=agent._explainer is not None if agent else False,
+        model_path=str(model_cfg.get("path", "")) if agent else "",
+        shap_ready=explainer is not None,
         background_shape=(
-            list(agent._explainer.get_background_shape())
-            if agent and agent._explainer
+            list(explainer.get_background_shape())
+            if explainer is not None
             else []
         ),
         decisions_served=_decision_store.total_count(),
@@ -421,27 +426,41 @@ async def agent_status(agent=Depends(get_agent)) -> AgentStatusResponse:
 # =============================================================================
 
 async def _publish_and_store(producer, decision, workload, store):
-    """Non-blocking: publish to Kafka and store in ring buffer."""
-    store.put(decision)
+    """
+    Non-blocking: store first (always), then attempt Kafka publish.
 
-    if producer is not None:
-        try:
-            producer.publish_decision(
-                {
-                    "decision_id": decision.decision_id,
-                    "workload_id": decision.workload_id,
-                    "cloud": decision.cloud,
-                    "region": decision.region,
-                    "instance_type": decision.instance_type,
-                    "purchase_option": decision.purchase_option,
-                    "cost_savings_pct": decision.cost_savings_pct,
-                    "carbon_savings_pct": decision.carbon_savings_pct,
-                    "latency_ms": decision.latency_ms,
-                    "estimated_cost_per_hr": decision.estimated_cost_per_hr,
-                    "workload_type": workload.get("workload_type", "batch"),
-                    "explanation": decision.explanation or {},
-                    "actual_reward": getattr(decision, "actual_reward", None),
-                }
-            )
-        except Exception as exc:
-            logger.warning("Kafka publish failed (non-fatal): %s", exc)
+    Store failures and Kafka failures are both non-fatal.
+    Producer is allowed to be None.
+    """
+    try:
+        store.put(decision)
+    except Exception as exc:
+        logger.warning("DecisionStore.put failed (non-fatal): %s", exc)
+
+    if producer is None:
+        return
+
+    try:
+        producer.publish_decision(
+            {
+                "decision_id": decision.decision_id,
+                "workload_id": decision.workload_id,
+                "cloud": decision.cloud,
+                "region": decision.region,
+                "instance_type": decision.instance_type,
+                "purchase_option": decision.purchase_option,
+                "cost_savings_pct": decision.cost_savings_pct,
+                "carbon_savings_pct": decision.carbon_savings_pct,
+                "latency_ms": decision.latency_ms,
+                "estimated_cost_per_hr": decision.estimated_cost_per_hr,
+                "workload_type": (
+                    workload.get("workload_type", "batch")
+                    if isinstance(workload, dict)
+                    else "batch"
+                ),
+                "explanation": decision.explanation or {},
+                "actual_reward": getattr(decision, "actual_reward", None),
+            }
+        )
+    except Exception as exc:
+        logger.warning("_publish_and_store: Kafka publish error (non-fatal): %s", exc)

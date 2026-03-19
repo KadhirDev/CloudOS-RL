@@ -6,6 +6,10 @@ Loads SchedulerAgent and KafkaProducer once at API startup.
 FastAPI dependency injection provides them to route handlers.
 Loading is done in a background thread during startup so the
 /health endpoint responds immediately while the model loads.
+
+SHAP is loaded in a second background thread after the PPO model
+is ready, so inference is available immediately even if SHAP
+takes longer or fails.
 """
 
 import logging
@@ -38,9 +42,9 @@ def _load_config() -> dict:
     else:
         logger.warning("config/settings.yaml not found — using env/default config only")
 
-    model_path = os.environ.get("CLOUDOS_MODEL_PATH", "")
-    vecnorm_path = os.environ.get("CLOUDOS_VECNORM_PATH", "")
-    kafka_boot = os.environ.get("CLOUDOS_KAFKA_BOOTSTRAP", "")
+    model_path = os.environ.get("CLOUDOS_MODEL_PATH", "").strip()
+    vecnorm_path = os.environ.get("CLOUDOS_VECNORM_PATH", "").strip()
+    kafka_boot = os.environ.get("CLOUDOS_KAFKA_BOOTSTRAP", "").strip()
 
     if model_path:
         cfg.setdefault("model", {})
@@ -67,6 +71,11 @@ def _load_config() -> dict:
 def _initialise() -> None:
     """
     Load the SchedulerAgent and Kafka producer once during API startup.
+
+    Step 1: Load PPO agent without SHAP (blocking but required)
+    Step 2: Load Kafka producer (non-fatal if unavailable)
+    Step 3: Mark service ready
+    Step 4: Load SHAP asynchronously and attach it if successful
     """
     global _agent, _producer, _ready
 
@@ -90,6 +99,9 @@ def _initialise() -> None:
         Path(vecnorm_path).exists() if vecnorm_path else False,
     )
 
+    # -------------------------------------------------------------------
+    # Step 1: Load PPO model without SHAP first
+    # -------------------------------------------------------------------
     try:
         from ai_engine.inference.scheduler_agent import SchedulerAgent
 
@@ -104,17 +116,18 @@ def _initialise() -> None:
             _agent = agent
 
         if agent:
-            shap_ready = getattr(agent, "_explainer", None) is not None
-            logger.info(
-                "AgentSingleton: SchedulerAgent ready (PPO%s)",
-                " + SHAP" if shap_ready else " only; SHAP unavailable",
-            )
+            logger.info("AgentSingleton: SchedulerAgent ready (PPO, SHAP pending)")
         else:
-            logger.warning("AgentSingleton: SchedulerAgent.load returned None — heuristic mode")
+            logger.warning(
+                "AgentSingleton: SchedulerAgent.load returned None — heuristic mode"
+            )
 
     except Exception as exc:
         logger.error("AgentSingleton: agent load failed: %s", exc, exc_info=True)
 
+    # -------------------------------------------------------------------
+    # Step 2: Kafka producer
+    # -------------------------------------------------------------------
     try:
         from ai_engine.kafka.producer import CloudOSProducer
 
@@ -126,10 +139,78 @@ def _initialise() -> None:
         logger.info("AgentSingleton: KafkaProducer ready")
 
     except Exception as exc:
-        logger.warning("AgentSingleton: Kafka unavailable (%s) — decisions won't publish", exc)
+        logger.warning(
+            "AgentSingleton: Kafka unavailable (%s) — decisions won't publish",
+            exc,
+        )
 
+    # -------------------------------------------------------------------
+    # Step 3: Mark ready now — API can serve immediately
+    # -------------------------------------------------------------------
     with _lock:
         _ready = True
+
+    logger.info("AgentSingleton: ready (SHAP loading in background)")
+
+    # -------------------------------------------------------------------
+    # Step 4: Load SHAP in separate background thread
+    # -------------------------------------------------------------------
+    def _load_shap_async() -> None:
+        try:
+            with _lock:
+                current_agent = _agent
+
+            if current_agent is None:
+                logger.warning(
+                    "AgentSingleton: SHAP skipped — agent unavailable"
+                )
+                return
+
+            current_model = getattr(current_agent, "_model", None)
+            if current_model is None:
+                logger.warning(
+                    "AgentSingleton: SHAP skipped — agent model unavailable"
+                )
+                return
+
+            from ai_engine.explainability.shap_explainer import SHAPExplainer
+            from ai_engine.explainability.explanation_formatter import (
+                ExplanationFormatter,
+            )
+
+            explainer = SHAPExplainer.load(
+                model=current_model,
+                config=config,
+                nsamples=50,
+            )
+
+            if explainer is not None:
+                formatter = ExplanationFormatter()
+                with _lock:
+                    if _agent is not None:
+                        _agent._explainer = explainer
+                        _agent._formatter = formatter
+
+                logger.info(
+                    "AgentSingleton: SHAP explainer attached (shap_ready=True)"
+                )
+            else:
+                logger.warning(
+                    "AgentSingleton: SHAP unavailable — inference continues without it"
+                )
+
+        except Exception as exc:
+            logger.warning(
+                "AgentSingleton: SHAP background load failed (%s)",
+                exc,
+            )
+
+    shap_thread = threading.Thread(
+        target=_load_shap_async,
+        daemon=True,
+        name="shap-init",
+    )
+    shap_thread.start()
 
     logger.info("AgentSingleton: initialisation complete")
 
