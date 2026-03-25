@@ -2,10 +2,11 @@
 Scheduling API Routes
 ======================
 POST /api/v1/schedule       — submit workload, get RL placement decision
-GET  /api/v1/decisions      — list recent decisions (last 100)
-GET  /api/v1/decisions/{id} — get single decision with full SHAP explanation
-POST /api/v1/batch          — submit multiple workloads, get decisions in parallel
-GET  /api/v1/status         — agent status (model loaded, SHAP ready, last decision)
+GET  /api/v1/decisions      — list recent decisions
+GET  /api/v1/decisions/{id} — get single decision
+POST /api/v1/decisions/{id}/explain — compute SHAP explanation in background
+POST /api/v1/batch          — submit multiple workloads
+GET  /api/v1/status         — agent/system status
 """
 
 import logging
@@ -13,6 +14,7 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
+import numpy as np
 import yaml
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
@@ -31,7 +33,7 @@ from backend.core.decision_store import DecisionStore
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["scheduling"])
 
-# Module-level decision store (in-memory ring buffer, last 1000 decisions)
+# In-memory store
 _decision_store = DecisionStore(max_size=1000)
 
 # Integer -> label mapping for model/action output
@@ -90,6 +92,38 @@ def _normalize_sla_tier(value: Any) -> str:
     return str(value)
 
 
+def _extract_internals(raw: Dict[str, Any]) -> tuple[Dict[str, Any], np.ndarray, Dict[str, Any]]:
+    """
+    Extract internal agent fields before schema conversion.
+
+    Returns:
+        cleaned_raw, state, decoded
+    """
+    raw = dict(raw or {})
+    state = raw.pop("_state", np.zeros(45, dtype=np.float32))
+    decoded = raw.pop("_decoded", {})
+
+    try:
+        state = np.asarray(state, dtype=np.float32)
+    except Exception:
+        state = np.zeros(45, dtype=np.float32)
+
+    if not isinstance(decoded, dict):
+        try:
+            if hasattr(decoded, "model_dump"):
+                decoded = decoded.model_dump()
+            elif hasattr(decoded, "dict"):
+                decoded = decoded.dict()
+            elif hasattr(decoded, "__dict__"):
+                decoded = {k: v for k, v in vars(decoded).items() if not k.startswith("_")}
+            else:
+                decoded = {}
+        except Exception:
+            decoded = {}
+
+    return raw, state, decoded
+
+
 def _to_scheduling_decision(
     raw: Dict[str, Any],
     *,
@@ -99,11 +133,6 @@ def _to_scheduling_decision(
 ) -> SchedulingDecision:
     """
     Convert raw scheduler/operator output into the API response model safely.
-
-    This prevents pydantic validation crashes when the RL agent returns:
-    - sla_tier as int instead of string
-    - missing estimated_cost_per_hr / savings fields
-    - missing explanation
     """
     raw = raw or {}
 
@@ -173,13 +202,6 @@ def _heuristic_fallback_decision(request: WorkloadRequest) -> SchedulingDecision
     response_model=SchedulingDecision,
     status_code=status.HTTP_200_OK,
     summary="Submit a workload for RL scheduling",
-    description="""
-    Accepts a workload specification and returns an RL-generated placement
-    decision including cloud, region, instance type, purchase option,
-    cost/carbon savings, and SHAP explainability.
-
-    Decision latency target: p95 < 100ms.
-    """,
 )
 async def schedule_workload(
     request: WorkloadRequest,
@@ -190,11 +212,12 @@ async def schedule_workload(
     if agent is None:
         decision = _heuristic_fallback_decision(request)
         background_tasks.add_task(
-            _publish_and_store,
+            _store_and_publish,
             producer,
             decision,
             request.to_agent_dict(),
-            _decision_store,
+            np.zeros(45, dtype=np.float32),
+            {},
         )
         return decision
 
@@ -206,13 +229,11 @@ async def schedule_workload(
     workload["workload_id"] = workload_id
 
     try:
-        # Live path: disable SHAP to keep latency low
         if hasattr(agent, "decide"):
             raw = agent.decide(workload, include_explanation=False)
         else:
             raw = agent.schedule(workload, include_explanation=False)
     except TypeError:
-        # Backward compatibility if method signature differs
         try:
             if hasattr(agent, "decide"):
                 raw = agent.decide(workload)
@@ -239,24 +260,34 @@ async def schedule_workload(
 
     total_latency_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    raw = dict(raw)
+    raw, state, decoded = _extract_internals(raw)
     raw["decision_id"] = decision_id
     raw["workload_id"] = workload_id
     raw["latency_ms"] = total_latency_ms
+    raw.setdefault("explanation", {})
+    raw.setdefault("sla_tier", "standard")
 
-    decision = _to_scheduling_decision(
-        raw,
-        workload_id=workload_id,
-        decision_id=decision_id,
-        latency_ms=total_latency_ms,
-    )
+    try:
+        decision = _to_scheduling_decision(
+            raw,
+            workload_id=workload_id,
+            decision_id=decision_id,
+            latency_ms=total_latency_ms,
+        )
+    except Exception as exc:
+        logger.error("SchedulingDecision conversion failed: %s | raw=%s", exc, raw, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Response schema error: {str(exc)[:300]}",
+        )
 
     background_tasks.add_task(
-        _publish_and_store,
+        _store_and_publish,
         producer,
         decision,
         workload,
-        _decision_store,
+        state,
+        decoded,
     )
 
     logger.info(
@@ -271,6 +302,56 @@ async def schedule_workload(
     )
 
     return decision
+
+
+# =============================================================================
+# POST /api/v1/decisions/{decision_id}/explain
+# =============================================================================
+
+@router.post(
+    "/decisions/{decision_id}/explain",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Compute SHAP explanation for a stored decision",
+)
+async def explain_decision(
+    decision_id: str,
+    background_tasks: BackgroundTasks,
+    agent=Depends(get_agent),
+):
+    get_record = getattr(_decision_store, "get_record", None)
+    if not callable(get_record):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Decision store does not support explanation records.",
+        )
+
+    record = get_record(decision_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Decision {decision_id} not found in store.",
+        )
+
+    explainer = getattr(agent, "_explainer", None) if agent else None
+    if agent is None or explainer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SHAP explainer not ready. Check /api/v1/status.",
+        )
+
+    background_tasks.add_task(
+        _compute_and_attach_explanation,
+        agent,
+        decision_id,
+        record.state,
+        record.decoded,
+    )
+
+    return {
+        "status": "accepted",
+        "decision_id": decision_id,
+        "message": "SHAP computing in background. Poll GET /api/v1/decisions/{id}.",
+    }
 
 
 # =============================================================================
@@ -302,11 +383,12 @@ async def schedule_batch(
                 d = _heuristic_fallback_decision(wl_req)
                 decisions.append(d)
                 background_tasks.add_task(
-                    _publish_and_store,
+                    _store_and_publish,
                     producer,
                     d,
                     wl_req.to_agent_dict(),
-                    _decision_store,
+                    np.zeros(45, dtype=np.float32),
+                    {},
                 )
                 continue
 
@@ -329,10 +411,13 @@ async def schedule_batch(
 
             if raw:
                 item_latency_ms = round((time.perf_counter() - item_t0) * 1000, 2)
-                raw = dict(raw)
+
+                raw, state, decoded = _extract_internals(raw)
                 raw["decision_id"] = decision_id
                 raw["workload_id"] = workload_id
                 raw["latency_ms"] = item_latency_ms
+                raw.setdefault("explanation", {})
+                raw.setdefault("sla_tier", "standard")
 
                 d = _to_scheduling_decision(
                     raw,
@@ -343,11 +428,12 @@ async def schedule_batch(
                 decisions.append(d)
 
                 background_tasks.add_task(
-                    _publish_and_store,
+                    _store_and_publish,
                     producer,
                     d,
                     workload,
-                    _decision_store,
+                    state,
+                    decoded,
                 )
             else:
                 errors.append(
@@ -393,7 +479,7 @@ async def list_decisions(
 @router.get(
     "/decisions/{decision_id}",
     response_model=SchedulingDecision,
-    summary="Get a single decision with full SHAP explanation",
+    summary="Get a single decision",
 )
 async def get_decision(decision_id: str) -> SchedulingDecision:
     d = _decision_store.get(decision_id)
@@ -424,15 +510,20 @@ async def agent_status(agent=Depends(get_agent)) -> AgentStatusResponse:
     config = getattr(agent, "_config", {}) if agent else {}
     model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
 
+    background_shape = []
+    if explainer is not None:
+        get_bg_shape = getattr(explainer, "get_background_shape", None)
+        if callable(get_bg_shape):
+            try:
+                background_shape = list(get_bg_shape())
+            except Exception:
+                background_shape = []
+
     return AgentStatusResponse(
         agent_loaded=agent is not None,
         model_path=str(model_cfg.get("path", "")) if agent else "",
         shap_ready=explainer is not None,
-        background_shape=(
-            list(explainer.get_background_shape())
-            if explainer is not None
-            else []
-        ),
+        background_shape=background_shape,
         decisions_served=_decision_store.total_count(),
         last_decision_id=last.decision_id if last else None,
         last_decision_cloud=last.cloud if last else None,
@@ -444,15 +535,16 @@ async def agent_status(agent=Depends(get_agent)) -> AgentStatusResponse:
 # Background task helpers
 # =============================================================================
 
-async def _publish_and_store(producer, decision, workload, store):
+def _store_and_publish(producer, decision, workload, state, decoded):
     """
-    Non-blocking: store first (always), then attempt Kafka publish.
-
-    Store failures and Kafka failures are both non-fatal.
-    Producer is allowed to be None.
+    Store first, then attempt Kafka publish.
+    Never raises.
     """
     try:
-        store.put(decision)
+        try:
+            _decision_store.put(decision, workload, state, decoded)
+        except TypeError:
+            _decision_store.put(decision)
     except Exception as exc:
         logger.warning("DecisionStore.put failed (non-fatal): %s", exc)
 
@@ -482,4 +574,41 @@ async def _publish_and_store(producer, decision, workload, store):
             }
         )
     except Exception as exc:
-        logger.warning("_publish_and_store: Kafka publish error (non-fatal): %s", exc)
+        logger.warning("Kafka publish failed (non-fatal): %s", exc)
+
+
+def _compute_and_attach_explanation(agent, decision_id, state, decoded):
+    """
+    Run SHAP on stored state and attach explanation if supported.
+    Never raises.
+    """
+    try:
+        logger.info("SHAP: computing for %s ...", decision_id[:8])
+
+        if hasattr(agent, "compute_explanation"):
+            explanation = agent.compute_explanation(state, decoded)
+        elif hasattr(agent, "_build_explanation"):
+            explanation = agent._build_explanation(
+                raw_state=state,
+                norm_state=state,
+                action=[],
+                decoded=decoded,
+                workload=decoded,
+                workload_dict=decoded if isinstance(decoded, dict) else {},
+            )
+        else:
+            explanation = None
+
+        if not explanation:
+            logger.warning("SHAP: returned empty explanation for %s", decision_id[:8])
+            return
+
+        attach = getattr(_decision_store, "attach_explanation", None)
+        if callable(attach):
+            attached = attach(decision_id, explanation)
+            logger.info("SHAP: complete for %s attached=%s", decision_id[:8], attached)
+        else:
+            logger.warning("Decision store does not support attach_explanation for %s", decision_id[:8])
+
+    except Exception as exc:
+        logger.warning("SHAP async compute failed for %s: %s", decision_id[:8], exc)

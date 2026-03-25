@@ -500,6 +500,11 @@ class SchedulerAgent:
             duration_ms=duration_ms,
         )
 
+        # Attach internals for route/storage layers.
+        # These are intentionally stripped before API schema validation.
+        result["_state"] = state
+        result["_decoded"] = self._normalise_decoded_payload(decoded)
+
         logger.info(
             "SchedulerAgent.schedule: completed in %.3f ms (explainer=%s)",
             duration_ms,
@@ -550,6 +555,40 @@ class SchedulerAgent:
                 pass
 
         return {"value": obj}
+
+    def _normalise_decoded_payload(self, decoded: Any) -> Dict[str, Any]:
+        """
+        Convert decoded action output into a plain dict for internal use.
+
+        This is kept intentionally conservative so downstream route/store code
+        can safely pop `_decoded` without receiving custom model instances.
+        """
+        if isinstance(decoded, dict):
+            return dict(decoded)
+
+        if hasattr(decoded, "model_dump"):
+            try:
+                data = decoded.model_dump()
+                if isinstance(data, dict):
+                    return dict(data)
+            except Exception:
+                pass
+
+        if hasattr(decoded, "dict"):
+            try:
+                data = decoded.dict()
+                if isinstance(data, dict):
+                    return dict(data)
+            except Exception:
+                pass
+
+        if hasattr(decoded, "__dict__"):
+            try:
+                return {k: v for k, v in vars(decoded).items() if not k.startswith("_")}
+            except Exception:
+                pass
+
+        return {"decision": str(decoded)}
 
     def _get_pricing(self) -> Dict[str, Any]:
         pricing: Dict[str, Any] = {}

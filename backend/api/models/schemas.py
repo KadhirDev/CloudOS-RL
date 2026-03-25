@@ -84,22 +84,30 @@ class ExplanationResponse(BaseModel):
 
 class SchedulingDecision(BaseModel):
     decision_id: str
-    workload_id: str
+    workload_id: str = ""
     cloud: str
     region: str
     instance_type: str
     purchase_option: str
     sla_tier: str = "standard"
-    estimated_cost_per_hr: float
-    cost_savings_pct: float
-    carbon_savings_pct: float
-    latency_ms: float
+    estimated_cost_per_hr: float = 0.0
+    cost_savings_pct: float = 0.0
+    carbon_savings_pct: float = 0.0
+    latency_ms: float = 0.0
     explanation: Optional[Dict[str, Any]] = None
+
+    # Silently ignore extra fields like _state / _decoded if they leak through
+    model_config = {"extra": "ignore"}
 
     @field_validator("cost_savings_pct", "carbon_savings_pct", mode="before")
     @classmethod
     def clamp_pct(cls, v: Any) -> float:
         return max(0.0, min(100.0, float(v or 0)))
+
+    @field_validator("estimated_cost_per_hr", "latency_ms", mode="before")
+    @classmethod
+    def to_float(cls, v: Any) -> float:
+        return float(v or 0)
 
 
 class BatchSchedulingResponse(BaseModel):
