@@ -19,8 +19,8 @@ data:
 
   CLOUDOS_LOG_LEVEL: "INFO"
 
-  # Kafka — FIXED (important ⚠)
-  CLOUDOS_KAFKA_BOOTSTRAP: host.minikube.internal:9092
+  # Kafka — FIXED
+  CLOUDOS_KAFKA_BOOTSTRAP: "192.168.49.1:9092"
 
   # Prometheus
   PROMETHEUS_URL: "http://host.minikube.internal:9091"
@@ -43,7 +43,7 @@ data:
       pricing_refresh_sec: 3600
 
     kafka:
-      bootstrap_servers: host.minikube.internal:9092
+      bootstrap_servers: "192.168.49.1:9092"
       group_id: cloudos-rl-k8s
       topics:
         decisions:    cloudos.scheduling.decisions

@@ -74,15 +74,15 @@ spec:
               protocol: TCP
 
           env:
-            - name: CLOUDOS_MODEL_PATH
-              value: "/app/models/best_model.zip"
-            - name: CLOUDOS_VECNORM_PATH
-              value: "/app/models/vec_normalize.pkl"
             - name: CLOUDOS_KAFKA_BOOTSTRAP
               valueFrom:
                 configMapKeyRef:
                   name: cloudos-config
                   key: CLOUDOS_KAFKA_BOOTSTRAP
+            - name: CLOUDOS_MODEL_PATH
+              value: "/app/models/best_model.zip"
+            - name: CLOUDOS_VECNORM_PATH
+              value: "/app/models/vec_normalize.pkl"
             - name: CLOUDOS_LOG_LEVEL
               value: "INFO"
             - name: PYTHONPATH

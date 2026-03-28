@@ -230,45 +230,79 @@ class ExplanationFormatter:
     @staticmethod
     def _compute_confidence(shap_output: Dict) -> float:
         """
-        Confidence proxy based on concentration of SHAP mass in top features.
+        Calibrated confidence scoring for KernelExplainer with small samples.
 
-        Returns a bounded value in approximately [0.35, 0.95] when there is
-        meaningful attribution, and 0.0 when SHAP values are absent/degenerate.
+        Design principles:
+        1. Concentration measure: how much of total SHAP mass is in top-5 features
+        2. Magnitude dampener: low absolute SHAP values -> noisy explanation -> lower confidence
+        3. Entropy penalty: uniform distribution of SHAP values -> low confidence
+        4. Sample-size cap: with small background/nsamples, confidence is capped
+
+        Output range: [0.25, 0.82]
+          0.75-0.82 : one or two features strongly dominate with meaningful magnitude
+          0.55-0.74 : moderate concentration with reasonable signal
+          0.35-0.54 : diffuse attribution, explanation is informative but uncertain
+          0.25-0.34 : near-uniform or near-zero SHAP values, low trust in explanation
         """
+        import math
+
         shap_vals = shap_output.get("shap_values", {})
         if not shap_vals:
             return 0.0
 
-        all_vals = list(shap_vals.values())
-        feature_count = len(all_vals)
-        if feature_count == 0:
+        vals = list(shap_vals.values())
+        n = len(vals)
+        if n == 0:
             return 0.0
 
-        all_abs = [abs(value) for value in all_vals]
+        all_abs = [abs(v) for v in vals]
         total_abs = sum(all_abs)
-        if total_abs < 1e-9:
-            return 0.0
 
-        top_k = min(5, feature_count)
-        top_k_abs = sorted(all_abs, reverse=True)[:top_k]
+        if total_abs < 1e-9:
+            return 0.25
+
+        k = min(5, n)
+        top_k_abs = sorted(all_abs, reverse=True)[:k]
         top_ratio = sum(top_k_abs) / total_abs
 
-        uniform_baseline = top_k / feature_count
+        uniform_baseline = k / n
         span = 1.0 - uniform_baseline
 
-        if span < 1e-9:
-            normalised = 0.5
-        else:
-            normalised = (top_ratio - uniform_baseline) / span
+        concentration = (
+            (top_ratio - uniform_baseline) / span
+            if span > 1e-9
+            else 0.0
+        )
+        concentration = max(0.0, min(1.0, concentration))
 
-        confidence = 0.35 + 0.60 * normalised
+        mean_abs = total_abs / n
+        magnitude_factor = 1.0 - math.exp(-mean_abs / 0.08)
+        magnitude_factor = max(0.0, min(1.0, magnitude_factor))
 
-        base_value = abs(float(shap_output.get("base_value", 0.0) or 0.0))
-        if base_value > 1e-9:
-            magnitude_ratio = min(1.0, total_abs / base_value)
-            confidence = 0.80 * confidence + 0.20 * (0.35 + 0.60 * magnitude_ratio)
+        probs = [a / total_abs for a in all_abs]
+        raw_entropy = -sum(p * math.log(p + 1e-12) for p in probs)
+        max_entropy = math.log(n)
+        normalised_entropy = raw_entropy / max_entropy if max_entropy > 0 else 1.0
+        entropy_penalty = normalised_entropy
 
-        return min(0.95, max(0.35, confidence))
+        base = 0.35 + 0.47 * concentration
+        dampened = 0.25 + (base - 0.25) * magnitude_factor
+        penalised = dampened - 0.15 * entropy_penalty
+
+        result = max(0.25, min(0.82, penalised))
+
+        logger.debug(
+            "_compute_confidence: concentration=%.3f magnitude=%.3f "
+            "entropy=%.3f base=%.3f dampened=%.3f final=%.3f",
+            concentration,
+            magnitude_factor,
+            normalised_entropy,
+            base,
+            dampened,
+            result,
+        )
+
+        return round(result, 3)
 
     @staticmethod
     def _empty_explanation() -> Dict:

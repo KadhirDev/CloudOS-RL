@@ -48,19 +48,24 @@ reward_weights:
 # Data Pipeline (Module G)
 # =============================================================================
 data_pipeline:
-  pricing_refresh_sec:      3600
-  carbon_refresh_sec:       900
-  cur_refresh_sec:          3600
-  pricing_output_path:      data/pricing/aws_pricing.json
+  pricing_refresh_sec: 3600
+  carbon_refresh_sec: 900
+  cur_refresh_sec: 3600
+  pricing_output_path: data/pricing/aws_pricing.json
   actual_costs_output_path: data/pricing/aws_actual_costs.json
-  carbon_output_path:       data/carbon/carbon_intensity.json
-  anomaly_threshold_pct:    50.0
+  carbon_output_path: data/carbon/carbon_intensity.json
+  anomaly_threshold_pct: 50.0
 
 kafka:
-  bootstrap_servers: localhost:9092
+  bootstrap_servers: "192.168.49.1:9092"
   partitions: 3
   replication: 1
-  group_id: cloudos-consumers
+  group_id: cloudos-rl-k8s
+  topics:
+    decisions: cloudos.scheduling.decisions
+    metrics: cloudos.metrics
+    alerts: cloudos.alerts
+    workload: cloudos.workload.events
 
 # =============================================================================
 # Prometheus (Module D)
@@ -73,14 +78,13 @@ prometheus:
 # Kafka → Prometheus Bridge (Module D)
 # =============================================================================
 bridge:
-  poll_timeout_seconds:           1.0
-  max_messages_per_poll:          100
+  poll_timeout_seconds: 1.0
+  max_messages_per_poll: 100
   pipeline_metrics_push_interval: 30
-  decision_window_seconds:        60
+  decision_window_seconds: 60
 
 aws:
   region: us-east-1
 
 logging:
   level: INFO
-
