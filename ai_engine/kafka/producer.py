@@ -42,7 +42,7 @@ _REQUIRED_DECISION_FIELDS = frozenset(
     ["decision_id", "cloud", "region", "instance_type", "purchase_option"]
 )
 
-# Reduced from 30s so delivery callbacks become visible quickly in logs.
+# Backup callback servicing interval.
 _FLUSH_INTERVAL_SEC = 5
 
 
@@ -232,8 +232,12 @@ class CloudOSProducer:
         """
         Publishes a scheduling decision to cloudos.scheduling.decisions.
 
-        Fire-and-forget. Never raises. Returns False if Kafka is unavailable or
-        the payload is missing required scheduling fields.
+        Uses flush() on the exact producer instance that executed produce(),
+        which guarantees delivery callbacks are serviced before this method
+        returns. This avoids callback races with the background flush thread.
+
+        Never raises. Returns False if Kafka is unavailable or the payload is
+        missing required scheduling fields.
         """
         missing = _REQUIRED_DECISION_FIELDS - set(decision.keys())
         if missing:
@@ -243,12 +247,17 @@ class CloudOSProducer:
             )
             return False
 
+        if not self._reconnect_if_needed():
+            return False
+
         raw_key = decision.get("decision_id")
-        key = str(raw_key) if raw_key else str(int(time.time() * 1000))
+        key_str = str(raw_key) if raw_key else str(int(time.time() * 1000))
+        encoded_key = key_str.encode("utf-8") if key_str else None
         display_id = str(raw_key)[:8] if raw_key else "?"
+        topic = self._topics["decisions"]
 
         payload = {
-            "decision_id": decision.get("decision_id", key),
+            "decision_id": decision.get("decision_id", key_str),
             "workload_id": decision.get("workload_id"),
             "cloud": decision.get("cloud"),
             "region": decision.get("region"),
@@ -266,13 +275,64 @@ class CloudOSProducer:
             "ts_iso": _now_iso(),
         }
 
+        encoded_value = json.dumps(payload, default=str).encode("utf-8")
+
         logger.info(
             "KafkaProducer: sending decision_id=%s to topic=%s",
             display_id,
-            self._topics["decisions"],
+            topic,
         )
 
-        return self._send(self._topics["decisions"], key, payload)
+        try:
+            with self._lock:
+                producer = self._producer
+                if producer is None:
+                    return False
+
+                producer.produce(
+                    topic=topic,
+                    key=encoded_key,
+                    value=encoded_value,
+                    on_delivery=self._on_delivery,
+                )
+
+            # Flush the exact producer instance used above.
+            remaining = producer.flush(timeout=5.0)
+            if remaining > 0:
+                logger.warning(
+                    "CloudOSProducer.publish_decision: flush timed out with %d "
+                    "undelivered message(s) for decision=%s",
+                    remaining,
+                    display_id,
+                )
+
+            return True
+
+        except BufferError:
+            logger.warning(
+                "CloudOSProducer.publish_decision: producer buffer full; flushing briefly"
+            )
+            try:
+                with self._lock:
+                    producer = self._producer
+                if producer is not None:
+                    producer.flush(5.0)
+            except Exception as exc:
+                logger.warning(
+                    "CloudOSProducer.publish_decision: flush after buffer-full failed "
+                    "(non-fatal): %s",
+                    exc,
+                )
+            return False
+
+        except Exception as exc:
+            logger.warning(
+                "CloudOSProducer.publish_decision: produce/flush failed (non-fatal) "
+                "decision=%s: %s",
+                display_id,
+                exc,
+            )
+            return False
 
     def publish_metrics(self, metrics: Dict[str, Any]) -> bool:
         """
@@ -339,10 +399,20 @@ class CloudOSProducer:
     # Internal send / topic init
     # ---------------------------------------------------------------------
 
-    def _send(self, topic: str, key: Optional[str], payload: Dict[str, Any]) -> bool:
+    def _send(
+        self,
+        topic: str,
+        key: Optional[str],
+        payload: Dict[str, Any],
+        callback_poll_timeout: float = 0.0,
+    ) -> bool:
         """
         Internal fire-and-forget send.
         Never raises. Returns False if Kafka is unavailable or produce fails.
+
+        Important: callback servicing is always performed on the exact producer
+        instance that executed produce(), avoiding races if self._producer is
+        replaced concurrently.
         """
         if not self._reconnect_if_needed():
             logger.debug(
@@ -367,6 +437,11 @@ class CloudOSProducer:
                     value=encoded_value,
                     on_delivery=self._on_delivery,
                 )
+
+            # Service callbacks on the same producer instance that produced the message.
+            if callback_poll_timeout > 0:
+                producer.poll(callback_poll_timeout)
+            else:
                 producer.poll(0)
 
             return True
@@ -451,8 +526,11 @@ class CloudOSProducer:
 
     def _flush_loop(self) -> None:
         """
-        Periodically polls/flushed the producer to service callbacks and avoid
-        queue buildup in low-traffic scenarios.
+        Lightweight backup daemon.
+
+        publish_decision() now uses flush() directly on the producer instance
+        that sent the message, so this loop should not compete with that path.
+        It only services any remaining callbacks/messages opportunistically.
         """
         while True:
             time.sleep(_FLUSH_INTERVAL_SEC)
@@ -465,12 +543,6 @@ class CloudOSProducer:
 
             try:
                 producer.poll(0)
-                remaining = producer.flush(timeout=2.0)
-                if remaining > 0:
-                    logger.debug(
-                        "CloudOSProducer.flush_loop: %d messages still queued",
-                        remaining,
-                    )
             except Exception as exc:
                 logger.debug("CloudOSProducer.flush_loop error: %s", exc)
 
@@ -481,13 +553,16 @@ class CloudOSProducer:
         Produces more actionable logs without raising.
         """
         if err is None:
+            raw_key = None
             try:
-                key = msg.key().decode("utf-8", errors="replace") if msg.key() else "?"
+                raw_key = msg.key()
             except Exception:
-                key = "?"
+                raw_key = None
+
+            key = raw_key.decode("utf-8", errors="replace")[:8] if raw_key else "?"
             logger.info(
                 "KafkaProducer: delivered key=%s topic=%s partition=%d offset=%d",
-                key[:8],
+                key,
                 msg.topic(),
                 msg.partition(),
                 msg.offset(),
@@ -497,30 +572,33 @@ class CloudOSProducer:
         try:
             from confluent_kafka import KafkaError
 
-            if err.code() == KafkaError.UNKNOWN_TOPIC_OR_PART:
+            code = err.code()
+            topic = msg.topic() if msg is not None else "?"
+
+            if code == KafkaError.UNKNOWN_TOPIC_OR_PART:
                 logger.error(
-                    "CloudOSProducer: topic '%s' does not exist on broker",
-                    msg.topic() if msg is not None else "?",
+                    "KafkaProducer: topic '%s' does not exist on broker",
+                    topic,
                 )
-            elif err.code() == KafkaError._MSG_TIMED_OUT:
+            elif code == KafkaError._MSG_TIMED_OUT:
                 logger.warning(
-                    "CloudOSProducer: message timed out for topic=%s",
-                    msg.topic() if msg is not None else "?",
+                    "KafkaProducer: message timed out for topic=%s",
+                    topic,
                 )
-            elif err.code() in (KafkaError._TRANSPORT, KafkaError.NETWORK_EXCEPTION):
+            elif code in (KafkaError._TRANSPORT, KafkaError.NETWORK_EXCEPTION):
                 logger.warning(
-                    "CloudOSProducer: transport/network error for topic=%s",
-                    msg.topic() if msg is not None else "?",
+                    "KafkaProducer: network error delivering to topic=%s",
+                    topic,
                 )
             else:
                 logger.warning(
-                    "CloudOSProducer: delivery failed topic=%s error=%s",
-                    msg.topic() if msg is not None else "?",
+                    "KafkaProducer: delivery failed topic=%s error=%s",
+                    topic,
                     err,
                 )
         except Exception:
             logger.warning(
-                "CloudOSProducer: delivery failed topic=%s error=%s",
+                "KafkaProducer: delivery failed topic=%s error=%s",
                 msg.topic() if msg is not None else "?",
                 err,
             )
