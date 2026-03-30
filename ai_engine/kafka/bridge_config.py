@@ -21,7 +21,10 @@ Config section in settings.yaml:
     decision_window_seconds: 60
 """
 
+from __future__ import annotations
+
 import logging
+import os
 from typing import Any, Dict
 
 try:
@@ -70,13 +73,17 @@ class BridgeConfig:
         self._raw = config
         self._config = config
 
-        kafka = config.get("kafka", {})
-        bridge = config.get("bridge", {})
-        prom = config.get("prometheus", {})
-        dp = config.get("data_pipeline", {})
+        kafka = config.get("kafka", {}) or {}
+        bridge = config.get("bridge", {}) or {}
+        prom = config.get("prometheus", {}) or {}
+        dp = config.get("data_pipeline", {}) or {}
+
+        # Env var override takes highest priority for runtime flexibility
+        env_bootstrap = os.environ.get("CLOUDOS_KAFKA_BOOTSTRAP", "").strip()
+        config_bootstrap = kafka.get("bootstrap_servers", "localhost:9092")
 
         # Attributes accessed directly by tests / runtime
-        self.bootstrap_servers = kafka.get("bootstrap_servers", "localhost:9092")
+        self.bootstrap_servers = env_bootstrap or config_bootstrap
         self.topics = kafka.get(
             "topics",
             {
@@ -112,6 +119,12 @@ class BridgeConfig:
         self.pipeline_push_interval = self.pipeline_metrics_push_interval
         self.decision_window = self.decision_window_seconds
 
+        if env_bootstrap:
+            logger.info(
+                "BridgeConfig: using CLOUDOS_KAFKA_BOOTSTRAP override=%s",
+                env_bootstrap,
+            )
+
     @classmethod
     def from_yaml(cls, path: str = "config/settings.yaml") -> "BridgeConfig":
         try:
@@ -127,7 +140,11 @@ class BridgeConfig:
 
         merged: Dict[str, Any] = {}
         for section, defaults in _DEFAULTS.items():
-            merged[section] = {**defaults, **(raw.get(section, {}) or {})}
+            raw_section = raw.get(section, {}) or {}
+            if isinstance(defaults, dict) and isinstance(raw_section, dict):
+                merged[section] = {**defaults, **raw_section}
+            else:
+                merged[section] = raw_section or defaults
 
         for k, v in raw.items():
             if k not in merged:

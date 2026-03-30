@@ -1,0 +1,441 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana",    "id": "grafana",    "name": "Grafana",    "version": "9.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel",      "id": "timeseries", "name": "Time series" },
+    { "type": "panel",      "id": "gauge",      "name": "Gauge"       },
+    { "type": "panel",      "id": "stat",       "name": "Stat"        },
+    { "type": "panel",      "id": "bargauge",   "name": "Bar gauge"   }
+  ],
+  "title": "CloudOS-RL Scheduler",
+  "uid":   "cloudos-rl-v2",
+  "description": "AI-native multi-cloud workload scheduler — PPO + SHAP + Kafka",
+  "schemaVersion": 38,
+  "version": 2,
+  "refresh": "10s",
+  "style": "dark",
+  "tags": ["cloudos", "rl", "kafka", "cost", "carbon"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "graphTooltip": 1,
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+
+    {
+      "id": 1,
+      "title": "Decisions / Minute",
+      "description": "Rate of RL placement decisions. Confirms API → Kafka → Bridge pipeline is active.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#808080", "value": null },
+              { "color": "green",   "value": 0.1  },
+              { "color": "blue",    "value": 5    }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(cloudos_decisions_total[1m])) * 60",
+          "legendFormat": "decisions/min",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 2,
+      "title": "Avg Cost Savings %",
+      "description": "Mean cost savings vs on-demand baseline across all decisions.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 15   },
+              { "color": "green",  "value": 27   }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(cloudos_cost_savings_ratio_sum[5m])) / sum(rate(cloudos_cost_savings_ratio_count[5m])) * 100",
+          "legendFormat": "avg cost savings %",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 3,
+      "title": "Avg Carbon Savings %",
+      "description": "Carbon intensity reduction vs us-east-1 baseline (415 gCO2/kWh).",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 10   },
+              { "color": "green",  "value": 18   }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(cloudos_carbon_savings_ratio_sum[5m])) / sum(rate(cloudos_carbon_savings_ratio_count[5m])) * 100",
+          "legendFormat": "avg carbon savings %",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "title": "Inference Latency p95",
+      "description": "95th percentile end-to-end scheduling latency. Target: < 100ms.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 75   },
+              { "color": "red",    "value": 100  }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(cloudos_inference_latency_seconds_bucket[5m])) by (le)) * 1000",
+          "legendFormat": "p95 latency ms",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 5,
+      "title": "Scheduling Decisions Over Time",
+      "description": "Rate of decisions per minute, broken down by cloud provider.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "auto",
+            "spanNulls": false
+          },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(cloudos_decisions_total[1m])) * 60",
+          "legendFormat": "Total",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (cloud) (rate(cloudos_decisions_total[1m])) * 60",
+          "legendFormat": "{{cloud}}",
+          "refId": "B"
+        }
+      ]
+    },
+
+    {
+      "id": 6,
+      "title": "Inference Latency Distribution (p50 / p95 / p99)",
+      "description": "End-to-end latency percentiles. Target: p95 < 100ms.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto"
+          },
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 100  }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p99" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p50" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(cloudos_inference_latency_seconds_bucket[2m])) by (le)) * 1000",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(cloudos_inference_latency_seconds_bucket[2m])) by (le)) * 1000",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(cloudos_inference_latency_seconds_bucket[2m])) by (le)) * 1000",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
+    },
+
+    {
+      "id": 7,
+      "title": "Cost Savings % — p50 / p90",
+      "description": "Distribution of cost savings. Target: p50 > 27%.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0, "max": 100,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "opacity"
+          },
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 15   },
+              { "color": "green",  "value": 27   }
+            ]
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(cloudos_cost_savings_ratio_bucket[5m])) by (le)) * 100",
+          "legendFormat": "p50 cost savings",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(cloudos_cost_savings_ratio_bucket[5m])) by (le)) * 100",
+          "legendFormat": "p90 cost savings",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(cloudos_cost_savings_ratio_sum[5m])) / sum(rate(cloudos_cost_savings_ratio_count[5m])) * 100",
+          "legendFormat": "avg cost savings",
+          "refId": "C"
+        }
+      ]
+    },
+
+    {
+      "id": 8,
+      "title": "Carbon Intensity by Region (gCO2/kWh)",
+      "description": "Live carbon intensity per region from Module G pipeline. eu-north-1 is cleanest.",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showUnfilled": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0, "max": 800,
+          "displayName": "${__field.labels.region}",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",       "value": null },
+              { "color": "light-green", "value": 100  },
+              { "color": "yellow",      "value": 250  },
+              { "color": "orange",      "value": 400  },
+              { "color": "red",         "value": 600  }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "cloudos_carbon_intensity_gco2_per_kwh",
+          "legendFormat": "{{region}}",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 9,
+      "title": "System Health",
+      "description": "Bridge status, pipeline fetch counters, active decisions window.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",   "value": null },
+              { "color": "green", "value": 1    }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Pricing Fetches" },
+            "properties": [
+              { "id": "mappings", "value": [] },
+              { "id": "unit",     "value": "short" }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "cloudos_bridge_up",
+          "legendFormat": "Bridge",
+          "instant": true,
+          "refId": "A"
+        },
+        {
+          "expr": "cloudos_pipeline_pricing_fetches_total",
+          "legendFormat": "Pricing Fetches",
+          "instant": true,
+          "refId": "B"
+        },
+        {
+          "expr": "cloudos_pipeline_carbon_fetches_total",
+          "legendFormat": "Carbon Fetches",
+          "instant": true,
+          "refId": "C"
+        },
+        {
+          "expr": "cloudos_active_decisions",
+          "legendFormat": "Active Decisions",
+          "instant": true,
+          "refId": "D"
+        }
+      ]
+    }
+
+  ]
+}   

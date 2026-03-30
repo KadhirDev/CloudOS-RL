@@ -3,6 +3,7 @@ import Layout from './components/Layout'
 import MetricsBar from './components/MetricsBar'
 import ScheduleForm from './components/ScheduleForm'
 import DecisionCard from './components/DecisionCard'
+import SystemStatus from './components/SystemStatus'
 import DecisionTable from './components/DecisionTable'
 import ToastContainer from './components/Toast'
 import { SkeletonDecisionCard } from './components/Skeleton'
@@ -58,7 +59,15 @@ function EmptyState() {
         </div>
       </div>
 
-      <div style={{ display: 'flex', gap: 8, marginTop: 4, flexWrap: 'wrap', justifyContent: 'center' }}>
+      <div
+        style={{
+          display: 'flex',
+          gap: 8,
+          marginTop: 4,
+          flexWrap: 'wrap',
+          justifyContent: 'center',
+        }}
+      >
         {['PPO Model', 'SHAP XAI', 'Multi-Cloud'].map((tag) => (
           <span key={tag} className="badge badge-blue">
             {tag}
@@ -116,6 +125,7 @@ export default function App() {
         </div>
 
         <MetricsBar />
+        <SystemStatus />
 
         <div
           style={{
@@ -126,10 +136,7 @@ export default function App() {
             alignItems: 'start',
           }}
         >
-          <ScheduleForm
-            onResult={handleResult}
-            onLoading={handleLoading}
-          />
+          <ScheduleForm onResult={handleResult} onLoading={handleLoading} />
 
           {scheduling ? (
             <SkeletonDecisionCard />
