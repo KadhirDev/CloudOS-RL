@@ -152,12 +152,8 @@ label {
 
 /* Skeleton */
 @keyframes shimmer {
-  0% {
-    background-position: -400px 0;
-  }
-  100% {
-    background-position: 400px 0;
-  }
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
 }
 
 .skeleton {
@@ -173,50 +169,25 @@ label {
 }
 
 /* Animations */
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 @keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
 }
 
 @keyframes slideIn {
-  from {
-    opacity: 0;
-    transform: translateX(20px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
+  from { opacity: 0; transform: translateX(20px); }
+  to   { opacity: 1; transform: none; }
 }
 
 @keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
+  0%,100% { opacity: 1; }
+  50%     { opacity: 0.5; }
 }
 
-.fade-in {
-  animation: fadeIn 0.25s ease both;
-}
-
-.slide-in {
-  animation: slideIn 0.25s ease both;
-}
+.fade-in { animation: fadeIn 0.25s ease both; }
+.slide-in { animation: slideIn 0.25s ease both; }
 
 /* Toast */
 .toast-container {
@@ -265,15 +236,8 @@ label {
 }
 
 /* Scrollbar */
-::-webkit-scrollbar {
-  width: 5px;
-  height: 5px;
-}
-
-::-webkit-scrollbar-track {
-  background: var(--surface);
-}
-
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--surface); }
 ::-webkit-scrollbar-thumb {
   background: var(--border2);
   border-radius: 3px;
@@ -285,3 +249,36 @@ label {
   background: var(--border);
   margin: 16px 0;
 }
+
+/* ── Light Mode ───────────────────────────────────────────────────────────── */
+[data-theme="light"] {
+  --bg:        #f1f5f9;
+  --surface:   #ffffff;
+  --surface2:  #f8fafc;
+  --surface3:  #f1f5f9;
+  --border:    #e2e8f0;
+  --border2:   #cbd5e1;
+  --accent:    #2563eb;
+  --accent2:   #4f46e5;
+  --green:     #059669;
+  --green2:    #10b981;
+  --yellow:    #d97706;
+  --red:       #dc2626;
+  --text:      #0f172a;
+  --text2:     #334155;
+  --muted:     #64748b;
+  --shadow:    0 4px 24px rgba(0,0,0,0.08);
+}
+
+[data-theme="light"] .card {
+  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+}
+
+[data-theme="light"] input,
+[data-theme="light"] select {
+  background: #f8fafc;
+}
+
+[data-theme="light"] .toast-success { background: rgba(5,150,105,0.1); color: #065f46; }
+[data-theme="light"] .toast-error   { background: rgba(220,38,38,0.1); color: #991b1b; }
+[data-theme="light"] .toast-info    { background: rgba(37,99,235,0.1); color: #1e3a8a; }

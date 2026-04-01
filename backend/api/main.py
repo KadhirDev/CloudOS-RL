@@ -11,7 +11,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.core.agent_singleton import startup_initialise, is_ready, get_agent
+from backend.api.routes.scheduling import router as scheduling_router
+from backend.auth.router import router as auth_router
+from backend.core.agent_singleton import get_agent, is_ready, startup_initialise
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,8 +46,8 @@ app.add_middleware(
 )
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-from backend.api.routes.scheduling import router as scheduling_router
 app.include_router(scheduling_router)
+app.include_router(auth_router)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -53,10 +55,10 @@ app.include_router(scheduling_router)
 async def health():
     agent = get_agent()
     return {
-        "status":       "ok",
+        "status": "ok",
         "agent_loaded": agent is not None,
-        "shap_ready":   agent._explainer is not None if agent else False,
-        "ready":        is_ready(),
+        "shap_ready": agent._explainer is not None if agent else False,
+        "ready": is_ready(),
     }
 
 

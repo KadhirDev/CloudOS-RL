@@ -26,7 +26,8 @@ RUN pip install --no-cache-dir \
         httpx==0.27.0 \
         requests==2.31.0 \
         prometheus-client==0.20.0 \
-        confluent-kafka==2.3.0
+        confluent-kafka==2.3.0 \
+        "python-jose[cryptography]"
 
 # Layer 2: scientific stack
 # Keep NumPy 2.x because the current model/vecnorm artifacts were loading

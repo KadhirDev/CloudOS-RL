@@ -1,0 +1,95 @@
+name: CloudOS-RL CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend-tests:
+    name: Backend — Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements*.txt', 'Dockerfile') }}
+
+      - name: Install core dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            fastapi uvicorn pyyaml pydantic pydantic-settings \
+            numpy scipy joblib requests pytest pytest-cov \
+            python-jose[cryptography]
+
+      - name: Install ML dependencies (CPU-only torch for CI speed)
+        run: |
+          pip install torch==2.3.0+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install stable-baselines3==2.3.0 gymnasium==0.29.1
+
+      - name: Install remaining deps
+        run: |
+          pip install shap==0.46.0 confluent-kafka prometheus-client boto3 httpx || true
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ \
+            --no-cov \
+            -v \
+            --tb=short \
+            -m "not k8s and not kafka and not network" \
+            --timeout=120
+        env:
+          CLOUDOS_AUTH_REQUIRED: "false"
+          PYTHONPATH: .
+
+      - name: Run auth smoke test
+        run: |
+          python -c "
+          from backend.auth.security import create_token, _decode_token
+          from backend.auth.models import Role
+          token = create_token('test', Role.engineer)
+          payload = _decode_token(token)
+          assert payload.sub == 'test'
+          assert payload.role == Role.engineer
+          print('Auth smoke test: PASS')
+          "
+        env:
+          PYTHONPATH: .
+
+  frontend-check:
+    name: Frontend — Lint check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: cloudos-ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: cloudos-ui
+        run: npm ci
+
+      - name: Build check
+        working-directory: cloudos-ui
+        run: npm run build
+        env:
+          VITE_API_URL: http://localhost:8001

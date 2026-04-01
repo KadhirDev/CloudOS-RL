@@ -10,8 +10,20 @@ const api = axios.create({
 })
 
 /**
- * Response + Error Interceptor (Debugging)
- * Safe for production (no breaking behavior)
+ * Attach Bearer token from localStorage if present
+ */
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('cloudos_token')
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+/**
+ * Response + Error Interceptor
+ * Safe for production and auth-aware
  */
 api.interceptors.response.use(
   (response) => {
@@ -21,7 +33,6 @@ api.interceptors.response.use(
         response?.data
       )
     } catch (e) {
-      // Prevent logging crash
       console.debug('[API] Response log failed')
     }
     return response
@@ -36,15 +47,21 @@ api.interceptors.response.use(
       console.error('[API] Error log failed')
     }
 
+    if (error?.response?.status === 401) {
+      // Token expired or missing — clear and let AuthContext handle redirect
+      localStorage.removeItem('cloudos_token')
+      localStorage.removeItem('cloudos_user')
+      window.dispatchEvent(new Event('cloudos:unauthorized'))
+    }
+
     return Promise.reject(error)
   }
 )
 
 /**
- * API Calls
- * NOTE: All return only response.data (no breaking change)
+ * Scheduling API
+ * All return only response.data
  */
-
 export const scheduleWorkload = (payload) =>
   api.post('/schedule', payload).then((r) => r.data)
 
@@ -59,3 +76,24 @@ export const getDecision = (id) =>
 
 export const explainDecision = (id) =>
   api.post(`/decisions/${id}/explain`).then((r) => r.data)
+
+/**
+ * Auth API
+ * Uses /auth base separately
+ */
+const authApi = axios.create({
+  baseURL: '/auth',
+  timeout: 10000,
+})
+
+export const login = (username, password) =>
+  authApi.post('/login', { username, password }).then((r) => r.data)
+
+export const getMe = () => {
+  const token = localStorage.getItem('cloudos_token')
+  return axios
+    .get('/auth/me', {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    .then((r) => r.data)
+}

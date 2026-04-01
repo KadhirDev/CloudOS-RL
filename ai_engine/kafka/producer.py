@@ -31,6 +31,14 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    from confluent_kafka import Producer as KafkaProducer
+except ImportError:
+    KafkaProducer = None
+
+# IMPORTANT FIX: expose Producer for tests
+Producer = KafkaProducer
+
 TOPICS = {
     "decisions": "cloudos.scheduling.decisions",
     "metrics": "cloudos.metrics",
@@ -56,14 +64,34 @@ class CloudOSProducer:
     - Preserve existing topic names and public methods
     """
 
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        bootstrap_servers: Optional[str] = None,
+    ):
+        # Backward compatibility:
+        # - CloudOSProducer(config_dict)
+        # - CloudOSProducer("host:9092")
+        # - CloudOSProducer(bootstrap_servers="host:9092")
+        if isinstance(config, str) and bootstrap_servers is None:
+            bootstrap_servers = config
+            config = {}
+
         config = config or {}
         self._config = config
         self._lock = threading.Lock()
 
         kafka_cfg = config.get("kafka", {}) or {}
 
-        self._servers = self._resolve_bootstrap(kafka_cfg)
+        if bootstrap_servers:
+            self._servers = bootstrap_servers
+            logger.info(
+                "CloudOSProducer: bootstrap_servers=%s (source: explicit argument)",
+                self._servers,
+            )
+        else:
+            self._servers = self._resolve_bootstrap(kafka_cfg)
+
         self._topics = dict(TOPICS)
 
         self._partitions = int(kafka_cfg.get("partitions", 3))
@@ -146,9 +174,7 @@ class CloudOSProducer:
         Create the Producer instance if possible.
         Never raises. Kafka remains optional.
         """
-        try:
-            from confluent_kafka import Producer
-        except ImportError:
+        if Producer is None:
             logger.warning(
                 "CloudOSProducer: confluent_kafka not installed; Kafka publish "
                 "will remain disabled (non-fatal)"

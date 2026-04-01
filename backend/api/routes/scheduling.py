@@ -30,6 +30,7 @@ from backend.api.models.schemas import (
 )
 from backend.core.agent_singleton import get_agent, get_producer
 from backend.core.decision_store import DecisionStore
+from backend.auth.security import can_schedule
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["scheduling"])
@@ -209,6 +210,7 @@ async def schedule_workload(
     background_tasks: BackgroundTasks,
     agent=Depends(get_agent),
     producer=Depends(get_producer),
+    _auth=Depends(can_schedule),
 ) -> SchedulingDecision:
     if agent is None:
         decision = _heuristic_fallback_decision(request)
