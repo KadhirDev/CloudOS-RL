@@ -4,25 +4,13 @@ SchedulerAgent
 Loads the trained PPO model and runs inference.
 Integrates SHAP explainability into every decision when available.
 
-Decision pipeline per request:
-  WorkloadRequest
-       ↓
-  build_state()           → float32 observation vector
-       ↓
-  VecNormalize.normalize  → optional observation normalization
-       ↓
-  PPO.predict()           → MultiDiscrete action
-       ↓
-  ActionDecoder.decode()  → Cloud decision dict / object
-       ↓
-  SHAPExplainer.explain() → optional attributions
-       ↓
-  ExplanationFormatter    → optional human-readable explanation
-       ↓
-  SchedulingDecision      → returned to API + Kafka producer
-
-SHAP is optional — if the model is not trained yet or the background dataset
-is missing, the agent still returns decisions without explanations.
+Optimized safely for concurrent inference:
+  - preserves existing public API and backward compatibility
+  - keeps robust model / vecnorm / numpy-pickle loading
+  - uses lock-free VecNormalize math when stats are available
+  - uses stampede-safe carbon TTL cache
+  - reduces repeated work in hot path
+  - keeps request/response behavior unchanged
 """
 
 from __future__ import annotations
@@ -44,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 _MODEL_PATH = Path("models/best/best_model")
 _VECNORM_PATH = Path("models/vec_normalize.pkl")
+
+# -------------------------------------------------------------------------
+# Module-level carbon TTL cache with stampede protection
+# -------------------------------------------------------------------------
+_carbon_cache_lock = threading.Lock()
+_carbon_cache_data: Dict[str, float] = {}
+_carbon_cache_ts: float = 0.0
+_carbon_cache_refreshing: bool = False
+_CARBON_CACHE_TTL = 60.0  # seconds
 
 
 class SchedulerAgent:
@@ -139,6 +136,18 @@ class SchedulerAgent:
         self._decoder = ActionDecoder()
         self._state_builder = StateBuilder(self._config)
         self._pricing_cache = PricingCache(self._config)
+
+        # Extract VecNormalize statistics once so the request path can avoid
+        # vec_env.normalize_obs() lock contention when available.
+        self._obs_mean: Optional[np.ndarray] = None
+        self._obs_var: Optional[np.ndarray] = None
+        self._obs_clip: float = 10.0
+        self._has_vecnorm_stats: bool = False
+        self._extract_vecnorm_stats()
+
+        # Reduce warning spam under load while keeping visibility.
+        self._slow_infer_warn_ms = 800.0
+        self._slow_data_warn_ms = 100.0
 
     # -------------------------------------------------------------------------
     # Factory
@@ -296,13 +305,6 @@ class SchedulerAgent:
     def _install_numpy_pickle_compat() -> None:
         """
         Install compatibility aliases for NumPy pickle module paths.
-
-        This helps when serialized SB3/PPO or VecNormalize artifacts were created
-        with a different NumPy major/minor version that referenced either:
-        - numpy.core.*
-        - numpy._core.*
-
-        The shim is safe: it only populates sys.modules aliases when missing.
         """
         try:
             core_mod = importlib.import_module("numpy.core")
@@ -375,46 +377,113 @@ class SchedulerAgent:
         return self._explainer is not None
 
     # -------------------------------------------------------------------------
-    # Cost / carbon helper methods
+    # VecNormalize optimization
     # -------------------------------------------------------------------------
-    def _od_price_for_region(self, region: str) -> float:
-        """Returns on-demand $/hr, trying PricingCache first then static table."""
-        region = str(region or self._BASELINE_REGION)
+    def _extract_vecnorm_stats(self) -> None:
+        """
+        Extract running mean/var from VecNormalize once at startup.
+        Under concurrency this avoids per-request lock contention inside
+        vec_env.normalize_obs() when stats are fixed for inference.
+        """
+        if self._vec_env is None:
+            return
 
         try:
-            if self._pricing_cache is not None:
-                flat = self._get_pricing()
-                if flat:
-                    if region in flat:
-                        price = float(flat[region])
-                        if price > 0:
-                            return price
+            obs_rms = getattr(self._vec_env, "obs_rms", None)
+            if obs_rms is None:
+                return
 
-                    baseline = flat.get(self._BASELINE_REGION)
-                    if baseline is not None:
+            mean = getattr(obs_rms, "mean", None)
+            var = getattr(obs_rms, "var", None)
+            if mean is None or var is None:
+                return
+
+            self._obs_mean = np.asarray(mean, dtype=np.float32).copy()
+            self._obs_var = np.asarray(var, dtype=np.float32).copy()
+            self._obs_clip = float(getattr(self._vec_env, "clip_obs", 10.0))
+            self._has_vecnorm_stats = True
+
+            logger.info(
+                "SchedulerAgent: extracted VecNormalize stats for lock-free normalization; shape=%s",
+                self._obs_mean.shape,
+            )
+        except Exception as exc:
+            logger.warning(
+                "SchedulerAgent: could not extract VecNormalize stats (%s) — falling back to vec_env.normalize_obs().",
+                exc,
+            )
+            self._obs_mean = None
+            self._obs_var = None
+            self._has_vecnorm_stats = False
+
+    # -------------------------------------------------------------------------
+    # Cost / carbon helper methods
+    # -------------------------------------------------------------------------
+    def _get_pricing(self) -> Dict[str, Any]:
+        pricing: Dict[str, Any] = {}
+
+        if self._pricing_cache is None:
+            return pricing
+
+        for method_name in ("get_current_pricing", "get_pricing"):
+            method = getattr(self._pricing_cache, method_name, None)
+            if callable(method):
+                try:
+                    pricing = method() or {}
+                    break
+                except Exception as exc:
+                    logger.debug("_get_pricing: %s failed (%s)", method_name, exc)
+
+        return pricing
+
+    def _od_price_for_region(self, region: str, pricing: Optional[Dict[str, Any]] = None) -> float:
+        """Returns on-demand $/hr, trying PricingCache first then static table."""
+        region = str(region or self._BASELINE_REGION)
+        flat = pricing if pricing is not None else self._get_pricing()
+
+        try:
+            if flat:
+                if region in flat:
+                    value = flat[region]
+                    if isinstance(value, (int, float)):
+                        price = float(value)
+                    elif isinstance(value, dict):
+                        price = float(value.get("on_demand_per_vcpu_hr", 0.0))
+                    else:
+                        price = 0.0
+                    if price > 0:
+                        return price
+
+                baseline = flat.get(self._BASELINE_REGION)
+                if baseline is not None:
+                    if isinstance(baseline, (int, float)):
                         price = float(baseline)
-                        if price > 0:
-                            return price
+                    elif isinstance(baseline, dict):
+                        price = float(baseline.get("on_demand_per_vcpu_hr", 0.0))
+                    else:
+                        price = 0.0
+                    if price > 0:
+                        return price
         except Exception:
             pass
 
         return self._STATIC_ON_DEMAND.get(region, self._STATIC_ON_DEMAND[self._BASELINE_REGION])
 
-    def _carbon_for_region(self, region: str) -> float:
+    def _carbon_for_region(self, region: str, carbon: Optional[Dict[str, float]] = None) -> float:
         """Returns gCO2/kWh, trying pipeline file first then static table."""
         region = str(region or self._BASELINE_REGION)
+        data = carbon if carbon is not None else self._load_carbon()
 
         try:
-            carbon = self._load_carbon()
-            if carbon:
-                if region in carbon:
-                    val = carbon[region]
+            if data:
+                if region in data:
+                    val = data[region]
                     parsed = float(val.get("gco2_per_kwh", val) if isinstance(val, dict) else val)
                     if parsed > 0:
                         return parsed
 
-                if self._BASELINE_REGION in carbon:
-                    val = carbon[self._BASELINE_REGION]
+                if self._BASELINE_REGION in data:
+                    val = data[self._BASELINE_REGION]
                     parsed = float(val.get("gco2_per_kwh", val) if isinstance(val, dict) else val)
                     if parsed > 0:
                         return parsed
@@ -432,7 +501,7 @@ class SchedulerAgent:
             return round(od * (1.0 - self._SPOT_DISCOUNT), 6)
         if purchase == "reserved_1yr":
             return round(od * self._RESERVED_1YR, 6)
-        if purchase == "reserved_3YR":
+        if purchase == "reserved_3yr":
             return round(od * self._RESERVED_3YR, 6)
 
         return round(od, 6)
@@ -456,6 +525,35 @@ class SchedulerAgent:
 
         return round(max(0.0, (1.0 - actual / baseline) * 100.0), 2)
 
+    def _estimate_cost_cached(self, decoded: Dict[str, Any], pricing: Dict[str, Any]) -> float:
+        region = str(decoded.get("region", self._BASELINE_REGION))
+        purchase = str(decoded.get("purchase_option", "on_demand")).lower()
+        od = self._od_price_for_region(region, pricing)
+
+        if purchase in {"spot", "preemptible"}:
+            return round(od * (1.0 - self._SPOT_DISCOUNT), 6)
+        if purchase == "reserved_1yr":
+            return round(od * self._RESERVED_1YR, 6)
+        if purchase == "reserved_3yr":
+            return round(od * self._RESERVED_3YR, 6)
+
+        return round(od, 6)
+
+    def _cost_savings_cached(self, decoded: Dict[str, Any], pricing: Dict[str, Any]) -> float:
+        baseline = self._od_price_for_region(self._BASELINE_REGION, pricing)
+        actual = self._estimate_cost_cached(decoded, pricing)
+        if baseline <= 0:
+            return 0.0
+        return round(max(0.0, (1.0 - actual / baseline) * 100.0), 2)
+
+    def _carbon_savings_cached(self, decoded: Dict[str, Any], carbon: Dict[str, float]) -> float:
+        region = str(decoded.get("region", self._BASELINE_REGION))
+        actual = self._carbon_for_region(region, carbon)
+        baseline = self._carbon_for_region(self._BASELINE_REGION, carbon)
+        if baseline <= 0:
+            return 0.0
+        return round(max(0.0, (1.0 - actual / baseline) * 100.0), 2)
+
     # -------------------------------------------------------------------------
     # Core inference
     # -------------------------------------------------------------------------
@@ -466,59 +564,117 @@ class SchedulerAgent:
     ) -> Dict[str, Any]:
         """
         Main inference entrypoint.
-        Accepts either a dict-like workload or a request model / dataclass object.
+        Delegates to decide() so timing/caching improvements are shared across
+        all call sites.
         """
-        started = time.perf_counter()
+        return self.decide(workload=workload, include_explanation=include_explanation)
+
+    def decide(
+        self,
+        workload: Any,
+        include_explanation: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Main inference entry point.
+        Keeps API behavior unchanged while reducing repeated work and contention.
+
+        torch.inference_mode() reduces per-call overhead during PPO prediction:
+          - disables autograd tracking
+          - disables view tracking
+          - safe because this path is inference-only
+        """
+        if self._model is None:
+            logger.error("SchedulerAgent.decide: model not loaded.")
+            return None
+
+        t_total = time.perf_counter()
 
         workload_dict = self._to_dict(workload)
-        logger.debug("SchedulerAgent.schedule: workload=%s", workload_dict)
+        if "cpu_request_vcpu" in workload_dict and "cpu_request" not in workload_dict:
+            workload_dict["cpu_request"] = workload_dict["cpu_request_vcpu"]
 
-        state = self._build_state(workload_dict)
+        # Step 1: load pricing + carbon
+        t0 = time.perf_counter()
+        pricing = self._get_pricing()
+        carbon = self._load_carbon()
+        t_data = (time.perf_counter() - t0) * 1000.0
+
+        # Step 2: build state
+        t0 = time.perf_counter()
+        state = self._build_state_with(workload_dict, pricing, carbon)
         state = self._ensure_state_array(state)
+        t_state = (time.perf_counter() - t0) * 1000.0
 
+        # Step 3: normalise observation
+        t0 = time.perf_counter()
         norm_state = self._normalise_obs(state)
-        action, _raw_action = self._predict(norm_state)
+        t_norm = (time.perf_counter() - t0) * 1000.0
+
+        # Step 4: PPO inference
+        t0 = time.perf_counter()
+        try:
+            import torch
+
+            with torch.inference_mode():
+                action, _raw_action = self._predict(norm_state)
+        except ImportError:
+            action, _raw_action = self._predict(norm_state)
         decoded = self._decode_action(action, workload, workload_dict)
+        t_infer = (time.perf_counter() - t0) * 1000.0
 
-        explanation = None
-        if include_explanation:
-            explanation = self._build_explanation(
-                raw_state=state,
-                norm_state=norm_state,
-                action=action,
-                decoded=decoded,
-                workload=workload,
-                workload_dict=workload_dict,
-            )
+        # Step 5: cost/carbon calculations
+        t0 = time.perf_counter()
+        decoded_dict = self._normalise_decoded_payload(decoded)
+        cost_per_hr = self._estimate_cost_cached(decoded_dict, pricing)
+        cost_savings = self._cost_savings_cached(decoded_dict, pricing)
+        carbon_savings = self._carbon_savings_cached(decoded_dict, carbon)
+        t_calc = (time.perf_counter() - t0) * 1000.0
 
-        duration_ms = round((time.perf_counter() - started) * 1000.0, 3)
+        latency_ms = (time.perf_counter() - t_total) * 1000.0
+
+        # Step 6: SHAP only when requested
+        explanation: Dict[str, Any] = {}
+        if include_explanation and self._explainer is not None and self._formatter is not None:
+            try:
+                built = self._build_explanation(
+                    raw_state=state,
+                    norm_state=norm_state,
+                    action=action,
+                    decoded=decoded,
+                    workload=workload,
+                    workload_dict=workload_dict,
+                )
+                if built is not None:
+                    explanation = built if isinstance(built, dict) else {"detail": built}
+            except Exception as exc:
+                logger.warning("SchedulerAgent: SHAP explain failed: %s", exc)
+
+        logger.debug(
+            "SchedulerAgent.decide: total=%.1fms [data=%.1f state=%.1f norm=%.1f infer=%.1f calc=%.1f]",
+            latency_ms, t_data, t_state, t_norm, t_infer, t_calc,
+        )
+        if t_infer > self._slow_infer_warn_ms:
+            logger.warning("SchedulerAgent: slow inference %.0fms", t_infer)
+        if t_data > self._slow_data_warn_ms:
+            logger.warning("SchedulerAgent: slow data load %.0fms", t_data)
 
         result = self._merge_decision_output(
             decoded=decoded,
             workload_dict=workload_dict,
             action=action,
             explanation=explanation,
-            duration_ms=duration_ms,
+            duration_ms=latency_ms,
         )
 
-        # Attach internals for route/storage layers.
-        # These are intentionally stripped before API schema validation.
+        result["estimated_cost_per_hr"] = round(cost_per_hr, 4)
+        result["cost_savings_pct"] = round(cost_savings, 2)
+        result["carbon_savings_pct"] = round(carbon_savings, 2)
+        result["latency_ms"] = round(latency_ms, 2)
+        result["explanation"] = explanation
         result["_state"] = state
-        result["_decoded"] = self._normalise_decoded_payload(decoded)
+        result["_decoded"] = dict(decoded_dict)
 
-        logger.info(
-            "SchedulerAgent.schedule: completed in %.3f ms (explainer=%s)",
-            duration_ms,
-            self._explainer is not None,
-        )
         return result
-
-    def decide(
-        self,
-        workload: Any,
-        include_explanation: bool = True,
-    ) -> Dict[str, Any]:
-        return self.schedule(workload=workload, include_explanation=include_explanation)
 
     def predict_decision(
         self,
@@ -530,10 +686,6 @@ class SchedulerAgent:
     def compute_explanation(self, state: np.ndarray, decoded: Dict) -> Dict:
         """
         Compute SHAP explanation in a guarded background-safe way.
-
-        - Logs real failure reasons instead of silently returning {}
-        - Adds a hard 120s timeout guard so SHAP cannot hang forever
-        - Returns formatted explanation dict, or {} on failure
         """
         if self._explainer is None:
             logger.warning("compute_explanation: _explainer is None — SHAP not loaded")
@@ -633,9 +785,6 @@ class SchedulerAgent:
     def _normalise_decoded_payload(self, decoded: Any) -> Dict[str, Any]:
         """
         Convert decoded action output into a plain dict for internal use.
-
-        This is kept intentionally conservative so downstream route/store code
-        can safely pop `_decoded` without receiving custom model instances.
         """
         if isinstance(decoded, dict):
             return dict(decoded)
@@ -664,28 +813,29 @@ class SchedulerAgent:
 
         return {"decision": str(decoded)}
 
-    def _get_pricing(self) -> Dict[str, Any]:
-        pricing: Dict[str, Any] = {}
-
-        if self._pricing_cache is None:
-            return pricing
-
-        for method_name in ("get_current_pricing", "get_pricing"):
-            method = getattr(self._pricing_cache, method_name, None)
-            if callable(method):
-                try:
-                    pricing = method() or {}
-                    break
-                except Exception as exc:
-                    logger.debug("_get_pricing: %s failed (%s)", method_name, exc)
-
-        return pricing
-
-    def _load_carbon(self) -> Dict[str, Any]:
+    def _load_carbon(self) -> Dict[str, float]:
         """
-        Best-effort carbon data loader.
+        Read carbon intensity data with a TTL cache and stampede protection.
+        Only one thread refreshes stale data; others get warm or stale data.
         """
-        carbon: Dict[str, Any] = {}
+        global _carbon_cache_data, _carbon_cache_ts, _carbon_cache_refreshing
+
+        now = time.monotonic()
+
+        # Fast path without lock
+        if _carbon_cache_data and (now - _carbon_cache_ts) < _CARBON_CACHE_TTL:
+            return dict(_carbon_cache_data)
+
+        with _carbon_cache_lock:
+            now = time.monotonic()
+
+            if _carbon_cache_data and (now - _carbon_cache_ts) < _CARBON_CACHE_TTL:
+                return dict(_carbon_cache_data)
+
+            if _carbon_cache_refreshing:
+                return dict(_carbon_cache_data) if _carbon_cache_data else dict(self._STATIC_CARBON)
+
+            _carbon_cache_refreshing = True
 
         path = (
             self._config.get("data_pipeline", {}).get("carbon_output_path")
@@ -695,21 +845,53 @@ class SchedulerAgent:
 
         try:
             carbon_path = Path(path)
+            result: Dict[str, float] = {}
+
             if carbon_path.exists():
                 with open(carbon_path, "r", encoding="utf-8") as fh:
-                    carbon = json.load(fh) or {}
-        except Exception as exc:
-            logger.debug("_load_carbon: failed to load carbon file (%s)", exc)
+                    raw = json.load(fh) or {}
 
-        return carbon
+                for region, entry in raw.items():
+                    if isinstance(entry, dict):
+                        result[region] = float(entry.get("gco2_per_kwh", 415.0))
+                    else:
+                        result[region] = float(entry)
+
+            if not result:
+                result = dict(self._STATIC_CARBON)
+
+            with _carbon_cache_lock:
+                _carbon_cache_data = dict(result)
+                _carbon_cache_ts = time.monotonic()
+                _carbon_cache_refreshing = False
+
+            return dict(result)
+
+        except Exception as exc:
+            logger.warning("SchedulerAgent._load_carbon: %s — using static", exc)
+
+            with _carbon_cache_lock:
+                if not _carbon_cache_data:
+                    _carbon_cache_data = dict(self._STATIC_CARBON)
+                    _carbon_cache_ts = time.monotonic()
+                _carbon_cache_refreshing = False
+                return dict(_carbon_cache_data)
 
     def build_state(self, workload: Dict[str, Any]) -> np.ndarray:
         """
         Public entry point — builds 45-dim state from workload dict.
         """
-        return self._build_state(workload)
+        workload_dict = self._to_dict(workload)
+        pricing = self._get_pricing()
+        carbon = self._load_carbon()
+        return self._build_state_with(workload_dict, pricing, carbon)
 
-    def _build_state(self, workload: Dict[str, Any]) -> np.ndarray:
+    def _build_state_with(
+        self,
+        workload: Dict[str, Any],
+        pricing: Dict[str, Any],
+        carbon: Dict[str, Any],
+    ) -> np.ndarray:
         """
         Calls StateBuilder.build(workload, pricing, carbon, history).
         Falls back carefully across older method signatures.
@@ -719,42 +901,28 @@ class SchedulerAgent:
         if "cpu_request_vcpu" in workload_dict and "cpu_request" not in workload_dict:
             workload_dict["cpu_request"] = workload_dict["cpu_request_vcpu"]
 
-        pricing = self._get_pricing()
-        carbon = self._load_carbon()
         history: List[Any] = []
 
         if self._state_builder is not None:
             try:
                 state = self._state_builder.build(workload_dict, pricing, carbon, history)
-                if isinstance(state, np.ndarray) and state.shape == (45,):
-                    logger.info("SchedulerAgent._build_state: using correct build(...) signature")
-                    return state.astype(np.float32)
-
                 if isinstance(state, np.ndarray):
-                    logger.warning(
-                        "_build_state: build() returned shape %s, expected (45,)",
-                        state.shape,
-                    )
                     return state.astype(np.float32)
-
-            except TypeError as exc:
-                logger.warning(
-                    "_build_state: build(workload, pricing, carbon, history) failed (%s) — trying fallbacks",
-                    exc,
-                )
+                return np.asarray(state, dtype=np.float32)
+            except TypeError:
+                pass
             except Exception as exc:
-                logger.error("SchedulerAgent._build_state: build() failed: %s", exc, exc_info=True)
-                raise
+                logger.error("SchedulerAgent._build_state_with: build() failed: %s", exc, exc_info=True)
 
             try:
                 state = self._state_builder.build(workload_dict)
                 if isinstance(state, np.ndarray):
-                    logger.info("SchedulerAgent._build_state: using fallback build(workload)")
                     return state.astype(np.float32)
+                return np.asarray(state, dtype=np.float32)
             except TypeError:
                 pass
             except Exception as exc:
-                logger.warning("_build_state: fallback build(workload) failed (%s)", exc)
+                logger.warning("_build_state_with: fallback build(workload) failed (%s)", exc)
 
             for method_name in ("build_state", "from_workload", "get_state"):
                 method = getattr(self._state_builder, method_name, None)
@@ -762,8 +930,8 @@ class SchedulerAgent:
                     try:
                         state = method(workload_dict)
                         if isinstance(state, np.ndarray):
-                            logger.info("SchedulerAgent._build_state: using fallback %s(...)", method_name)
                             return state.astype(np.float32)
+                        return np.asarray(state, dtype=np.float32)
                     except Exception:
                         continue
 
@@ -775,6 +943,12 @@ class SchedulerAgent:
         )
         return np.zeros(45, dtype=np.float32)
 
+    def _build_state(self, workload: Dict[str, Any]) -> np.ndarray:
+        workload_dict = self._to_dict(workload)
+        pricing = self._get_pricing()
+        carbon = self._load_carbon()
+        return self._build_state_with(workload_dict, pricing, carbon)
+
     def _ensure_state_array(self, state: Any) -> np.ndarray:
         arr = np.asarray(state, dtype=np.float32)
         if arr.ndim > 1:
@@ -782,6 +956,27 @@ class SchedulerAgent:
         return arr
 
     def _normalise_obs(self, state: np.ndarray) -> np.ndarray:
+        """
+        Fast path:
+          use pre-extracted VecNormalize stats and apply the same transform
+          without calling vec_env.normalize_obs() on every request.
+
+        Safe fallback:
+          if stats are unavailable, use vec_env.normalize_obs().
+        """
+        state = np.asarray(state, dtype=np.float32)
+
+        if self._has_vecnorm_stats and self._obs_mean is not None and self._obs_var is not None:
+            try:
+                normed = (state - self._obs_mean) / np.sqrt(self._obs_var + 1e-8)
+                normed = np.clip(normed, -self._obs_clip, self._obs_clip)
+                return normed.astype(np.float32)
+            except Exception as exc:
+                logger.warning(
+                    "SchedulerAgent: lock-free normalization failed (%s) — falling back to vec_env.normalize_obs().",
+                    exc,
+                )
+
         if self._vec_env is None:
             return state
 
@@ -969,7 +1164,6 @@ class SchedulerAgent:
         base.setdefault("action", action)
         base["inference_ms"] = duration_ms
 
-        # Populate business metrics if missing or zero-like
         estimated = base.get("estimated_cost_per_hr")
         if estimated in (None, "", 0, 0.0):
             base["estimated_cost_per_hr"] = self.estimate_cost_per_hr(base)
@@ -1002,6 +1196,7 @@ class SchedulerAgent:
         return {
             "agent_loaded": self._model is not None,
             "vecnorm_loaded": self._vec_env is not None,
+            "vecnorm_stats_loaded": self._has_vecnorm_stats,
             "shap_ready": self._explainer is not None,
             "model_type": type(self._model).__name__ if self._model is not None else None,
         }

@@ -4,12 +4,14 @@ CloudOS-RL FastAPI Application
 Entry point for the scheduling API.
 """
 
+import asyncio
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from backend.api.routes.scheduling import router as scheduling_router
 from backend.auth.router import router as auth_router
@@ -21,19 +23,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# CPU-aware default executor for blocking inference offloaded via run_in_threadpool()
+# or loop.run_in_executor(). A fixed 32 workers can oversubscribe small Minikube/Docker
+# environments and increase tail latency for CPU-bound PPO inference.
+_CPU_COUNT = os.cpu_count() or 4
+_POOL_SIZE = min(32, max(4, _CPU_COUNT * 2))
+
+_INFERENCE_POOL = ThreadPoolExecutor(
+    max_workers=_POOL_SIZE,
+    thread_name_prefix="cloudos-inf",
+)
+
+logger.info(
+    "CloudOS-RL: thread pool sized to %d workers (%d CPUs detected)",
+    _POOL_SIZE,
+    _CPU_COUNT,
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: load agent in background. Shutdown: flush Kafka."""
-    logger.info("CloudOS-RL API starting — loading RL agent in background ...")
+    """
+    Startup:
+      - install the default thread pool executor
+      - initialise the RL agent / Kafka producer
+
+    Shutdown:
+      - gracefully stop the executor
+    """
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(_INFERENCE_POOL)
+    logger.info(
+        "CloudOS-RL API: thread pool configured (max_workers=%d)",
+        _POOL_SIZE,
+    )
+
+    logger.info("CloudOS-RL API starting — loading RL agent ...")
     startup_initialise()
-    yield
-    logger.info("CloudOS-RL API shutting down.")
+
+    try:
+        yield
+    finally:
+        logger.info("CloudOS-RL API shutting down.")
+        _INFERENCE_POOL.shutdown(wait=False)
 
 
 app = FastAPI(
     title="CloudOS-RL Scheduling API",
-    description="AI-native multi-cloud workload scheduler powered by PPO reinforcement learning.",
+    description="AI-native multi-cloud workload scheduler — PPO + SHAP + Kafka.",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -45,12 +82,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# Routes
 app.include_router(scheduling_router)
 app.include_router(auth_router)
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# Health
 @app.get("/health", tags=["health"])
 async def health():
     agent = get_agent()

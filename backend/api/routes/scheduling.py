@@ -10,7 +10,9 @@ POST /api/v1/batch          — submit multiple workloads
 GET  /api/v1/status         — agent/system status
 """
 
+import asyncio
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -18,6 +20,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import yaml
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 
 from ai_engine.operator.operator import CloudOSOperator
 from backend.api.models.schemas import (
@@ -28,9 +31,9 @@ from backend.api.models.schemas import (
     SchedulingDecision,
     WorkloadRequest,
 )
+from backend.auth.security import can_schedule
 from backend.core.agent_singleton import get_agent, get_producer
 from backend.core.decision_store import DecisionStore
-from backend.auth.security import can_schedule
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["scheduling"])
@@ -47,6 +50,22 @@ SLA_TIER_MAP = {
     4: "platinum",
     5: "critical",
 }
+
+# -----------------------------------------------------------------------------
+# Inference concurrency gate
+# -----------------------------------------------------------------------------
+# Limit concurrent blocking inference before entering the thread pool.
+# This prevents 20+ requests from all running PPO predict at once and
+# oversubscribing CPU under load.
+_CPU_COUNT = os.cpu_count() or 4
+_MAX_CONCURRENT_INFERENCE = min(16, max(4, _CPU_COUNT * 2))
+_infer_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_INFERENCE)
+
+logger.info(
+    "SchedulingRouter: inference semaphore set to %d (%d CPUs detected)",
+    _MAX_CONCURRENT_INFERENCE,
+    _CPU_COUNT,
+)
 
 
 # =============================================================================
@@ -186,6 +205,8 @@ def _heuristic_fallback_decision(request: WorkloadRequest) -> SchedulingDecision
     raw["decision_id"] = fallback_decision_id
     raw["workload_id"] = fallback_workload_id
     raw["latency_ms"] = 1.0
+    raw.setdefault("explanation", {})
+    raw.setdefault("sla_tier", "standard")
 
     return _to_scheduling_decision(
         raw,
@@ -193,6 +214,29 @@ def _heuristic_fallback_decision(request: WorkloadRequest) -> SchedulingDecision
         decision_id=fallback_decision_id,
         latency_ms=1.0,
     )
+
+
+async def _run_agent_inference(agent, workload: Dict[str, Any]):
+    """
+    Run blocking model inference in FastAPI's thread pool while gating
+    concurrency with an async semaphore to reduce CPU oversubscription.
+    """
+    async with _infer_semaphore:
+        try:
+            if hasattr(agent, "decide"):
+                try:
+                    return await run_in_threadpool(agent.decide, workload, False)
+                except TypeError:
+                    return await run_in_threadpool(agent.decide, workload)
+            if hasattr(agent, "schedule"):
+                try:
+                    return await run_in_threadpool(agent.schedule, workload, False)
+                except TypeError:
+                    return await run_in_threadpool(agent.schedule, workload)
+            raise RuntimeError("Agent has neither decide() nor schedule()")
+        except Exception as exc:
+            logger.error("SchedulerAgent inference failed: %s", exc, exc_info=True)
+            raise
 
 
 # =============================================================================
@@ -232,24 +276,8 @@ async def schedule_workload(
     workload["workload_id"] = workload_id
 
     try:
-        if hasattr(agent, "decide"):
-            raw = agent.decide(workload, include_explanation=False)
-        else:
-            raw = agent.schedule(workload, include_explanation=False)
-    except TypeError:
-        try:
-            if hasattr(agent, "decide"):
-                raw = agent.decide(workload)
-            else:
-                raw = agent.schedule(workload)
-        except Exception as exc:
-            logger.error("SchedulerAgent inference failed: %s", exc, exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"RL inference error: {str(exc)[:200]}",
-            )
+        raw = await _run_agent_inference(agent, workload)
     except Exception as exc:
-        logger.error("SchedulerAgent inference failed: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"RL inference error: {str(exc)[:200]}",
@@ -365,6 +393,18 @@ async def explain_decision(
             ),
         }
 
+    if getattr(record, "_explain_in_progress", False):
+        return {
+            "status": "in_progress",
+            "decision_id": decision_id,
+            "message": "Explanation already computing.",
+        }
+
+    try:
+        record._explain_in_progress = True
+    except Exception:
+        pass
+
     background_tasks.add_task(
         _compute_and_attach_explanation,
         agent,
@@ -398,6 +438,7 @@ async def schedule_batch(
     background_tasks: BackgroundTasks,
     agent=Depends(get_agent),
     producer=Depends(get_producer),
+    _auth=Depends(can_schedule),
 ) -> BatchSchedulingResponse:
     if len(request.workloads) > 50:
         raise HTTPException(status_code=400, detail="Maximum 50 workloads per batch")
@@ -406,11 +447,10 @@ async def schedule_batch(
     errors = []
     t0 = time.perf_counter()
 
-    for i, wl_req in enumerate(request.workloads):
+    async def _infer_one(i: int, wl_req: WorkloadRequest):
         try:
             if agent is None:
                 d = _heuristic_fallback_decision(wl_req)
-                decisions.append(d)
                 background_tasks.add_task(
                     _store_and_publish,
                     producer,
@@ -419,7 +459,7 @@ async def schedule_batch(
                     np.zeros(45, dtype=np.float32),
                     {},
                 )
-                continue
+                return d, None
 
             item_t0 = time.perf_counter()
             workload = wl_req.to_agent_dict()
@@ -427,53 +467,53 @@ async def schedule_batch(
             workload_id = getattr(wl_req, "workload_id", None) or f"batch-{i}"
             workload["workload_id"] = workload_id
 
-            try:
-                if hasattr(agent, "decide"):
-                    raw = agent.decide(workload, include_explanation=False)
-                else:
-                    raw = agent.schedule(workload, include_explanation=False)
-            except TypeError:
-                if hasattr(agent, "decide"):
-                    raw = agent.decide(workload)
-                else:
-                    raw = agent.schedule(workload)
+            raw = await _run_agent_inference(agent, workload)
 
-            if raw:
-                item_latency_ms = round((time.perf_counter() - item_t0) * 1000, 2)
+            if raw is None:
+                return None, {
+                    "index": i,
+                    "error": "Agent returned no decision. Model may be uninitialised.",
+                }
 
-                raw, state, decoded = _extract_internals(raw)
-                raw["decision_id"] = decision_id
-                raw["workload_id"] = workload_id
-                raw["latency_ms"] = item_latency_ms
-                raw.setdefault("explanation", {})
-                raw.setdefault("sla_tier", "standard")
+            item_latency_ms = round((time.perf_counter() - item_t0) * 1000, 2)
 
-                d = _to_scheduling_decision(
-                    raw,
-                    workload_id=workload_id,
-                    decision_id=decision_id,
-                    latency_ms=item_latency_ms,
-                )
-                decisions.append(d)
+            raw, state, decoded = _extract_internals(raw)
+            raw["decision_id"] = decision_id
+            raw["workload_id"] = workload_id
+            raw["latency_ms"] = item_latency_ms
+            raw.setdefault("explanation", {})
+            raw.setdefault("sla_tier", "standard")
 
-                background_tasks.add_task(
-                    _store_and_publish,
-                    producer,
-                    d,
-                    workload,
-                    state,
-                    decoded,
-                )
-            else:
-                errors.append(
-                    {
-                        "index": i,
-                        "error": "Agent returned no decision. Model may be uninitialised.",
-                    }
-                )
+            d = _to_scheduling_decision(
+                raw,
+                workload_id=workload_id,
+                decision_id=decision_id,
+                latency_ms=item_latency_ms,
+            )
+
+            background_tasks.add_task(
+                _store_and_publish,
+                producer,
+                d,
+                workload,
+                state,
+                decoded,
+            )
+            return d, None
+
         except Exception as exc:
             logger.error("Batch scheduling failed for index %s: %s", i, exc, exc_info=True)
-            errors.append({"index": i, "error": str(exc)[:200]})
+            return None, {"index": i, "error": str(exc)[:200]}
+
+    results = await asyncio.gather(
+        *[_infer_one(i, wl_req) for i, wl_req in enumerate(request.workloads)]
+    )
+
+    for d, err in results:
+        if d is not None:
+            decisions.append(d)
+        if err is not None:
+            errors.append(err)
 
     return BatchSchedulingResponse(
         decisions=decisions,
@@ -676,6 +716,13 @@ def _compute_and_attach_explanation(agent, decision_id, state, decoded):
         }
 
     attached = _decision_store.attach_explanation(decision_id, explanation)
+
+    record = _decision_store.get_record(decision_id)
+    if record is not None:
+        try:
+            record._explain_in_progress = False
+        except Exception:
+            pass
 
     logger.info(
         "SHAP: complete for %s — attached=%s confidence=%.3f elapsed=%.0fms",
