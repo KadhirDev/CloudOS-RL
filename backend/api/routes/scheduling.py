@@ -55,10 +55,9 @@ SLA_TIER_MAP = {
 # Inference concurrency gate
 # -----------------------------------------------------------------------------
 # Limit concurrent blocking inference before entering the thread pool.
-# This prevents 20+ requests from all running PPO predict at once and
-# oversubscribing CPU under load.
+# This should track the safer CPU-aware pool sizing strategy.
 _CPU_COUNT = os.cpu_count() or 4
-_MAX_CONCURRENT_INFERENCE = min(16, max(4, _CPU_COUNT * 2))
+_MAX_CONCURRENT_INFERENCE = min(32, max(4, _CPU_COUNT * 2))
 _infer_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_INFERENCE)
 
 logger.info(

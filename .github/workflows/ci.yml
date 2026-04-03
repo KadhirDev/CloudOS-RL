@@ -24,37 +24,74 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/.cache/pip
-          key: pip-${{ hashFiles('requirements*.txt', 'Dockerfile') }}
+          key: pip-${{ hashFiles('**/requirements*.txt', 'Dockerfile') }}-v2
 
-      - name: Install core dependencies
+      # 🔥 CRITICAL FIX — Kafka requires system lib
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            librdkafka-dev \
+            build-essential
+
+      # Core backend deps
+      - name: Install core Python dependencies
         run: |
           pip install --upgrade pip
           pip install \
-            fastapi uvicorn pyyaml pydantic pydantic-settings \
-            numpy scipy joblib requests pytest pytest-cov \
-            python-jose[cryptography]
+            fastapi \
+            uvicorn \
+            pyyaml \
+            pydantic \
+            pydantic-settings \
+            "python-jose[cryptography]" \
+            numpy \
+            scipy \
+            joblib \
+            requests \
+            httpx \
+            boto3 \
+            prometheus-client
 
+      # 🔥 FIX — pytest-timeout required for --timeout flag
+      - name: Install test dependencies
+        run: |
+          pip install \
+            pytest \
+            pytest-cov \
+            pytest-timeout
+
+      # Kafka client
+      - name: Install Kafka client
+        run: |
+          pip install confluent-kafka
+
+      # ML stack
       - name: Install ML dependencies (CPU-only torch for CI speed)
         run: |
-          pip install torch==2.3.0+cpu --index-url https://download.pytorch.org/whl/cpu
-          pip install stable-baselines3==2.3.0 gymnasium==0.29.1
+          pip install torch==2.3.0+cpu \
+            --index-url https://download.pytorch.org/whl/cpu
+          pip install \
+            stable-baselines3==2.3.0 \
+            gymnasium==0.29.1
 
-      - name: Install remaining deps
+      # SHAP
+      - name: Install SHAP
         run: |
-          pip install shap==0.46.0 confluent-kafka prometheus-client boto3 httpx || true
+          pip install "shap==0.46.0" || pip install shap
 
-      - name: Run unit tests
+      # 🔍 Validate environment before tests
+      - name: Verify critical imports
         run: |
-          python -m pytest tests/ \
-            --no-cov \
-            -v \
-            --tb=short \
-            -m "not k8s and not kafka and not network" \
-            --timeout=120
+          python -c "import fastapi; print('fastapi OK')"
+          python -c "import confluent_kafka; print('confluent_kafka OK')"
+          python -c "import torch; print('torch OK')"
+          python -c "import stable_baselines3; print('stable_baselines3 OK')"
+          python -c "from jose import jwt; print('jose OK')"
         env:
-          CLOUDOS_AUTH_REQUIRED: "false"
           PYTHONPATH: .
 
+      # 🔐 Auth sanity check
       - name: Run auth smoke test
         run: |
           python -c "
@@ -68,9 +105,24 @@ jobs:
           "
         env:
           PYTHONPATH: .
+          CLOUDOS_AUTH_REQUIRED: "false"
+
+      # 🧪 Run tests
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ \
+            --no-cov \
+            -v \
+            --tb=short \
+            --timeout=120 \
+            -m "not k8s and not kafka and not network" \
+            -x
+        env:
+          CLOUDOS_AUTH_REQUIRED: "false"
+          PYTHONPATH: .
 
   frontend-check:
-    name: Frontend — Lint check
+    name: Frontend — Build check
     runs-on: ubuntu-latest
 
     steps:
@@ -88,7 +140,7 @@ jobs:
         working-directory: cloudos-ui
         run: npm ci
 
-      - name: Build check
+      - name: Build
         working-directory: cloudos-ui
         run: npm run build
         env:

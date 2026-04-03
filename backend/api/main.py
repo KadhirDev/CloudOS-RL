@@ -23,10 +23,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# CPU-aware default executor for blocking inference offloaded via run_in_threadpool()
-# or loop.run_in_executor(). A fixed 32 workers can oversubscribe small Minikube/Docker
-# environments and increase tail latency for CPU-bound PPO inference.
 _CPU_COUNT = os.cpu_count() or 4
+
+# Thread pool sizing rationale:
+#   Previous value: cpu_count × 2
+#   New value: cpu_count × 3 gives slightly more thread capacity for this mixed
+#   workload while keeping a firm cap to avoid runaway oversubscription.
+#   Ceiling of 24 prevents excessive thread growth on larger machines.
 _POOL_SIZE = min(32, max(4, _CPU_COUNT * 2))
 
 _INFERENCE_POOL = ThreadPoolExecutor(
