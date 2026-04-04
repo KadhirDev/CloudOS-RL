@@ -52,6 +52,8 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
         shap==0.46.0
 
+RUN pip install --no-cache-dir passlib[bcrypt] bcrypt==3.2.2
+
 # ── Application code ──────────────────────────────────────────────────────────
 WORKDIR /app
 COPY . .
