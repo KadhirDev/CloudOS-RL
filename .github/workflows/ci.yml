@@ -53,7 +53,7 @@ jobs:
             pydantic \
             pydantic-settings \
             "python-jose[cryptography]" \
-            numpy \
+            numpy==1.26.4 \
             scipy \
             joblib \
             requests \
