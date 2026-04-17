@@ -38,7 +38,7 @@ spec:
             - sh
             - -c
             - |
-              echo "Waiting for Kafka at host.minikube.internal:9092 ..."
+              echo "Waiting for Kafka at 192.168.49.1:9092 ..."
               until nc -z host.minikube.internal 9092; do
                 echo "  Not ready — retrying in 5s"
                 sleep 5
