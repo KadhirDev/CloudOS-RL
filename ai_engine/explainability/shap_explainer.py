@@ -251,6 +251,9 @@ class SHAPExplainer:
             logger.error("SHAPExplainer: invalid state input: %s", exc)
             return self._empty_explanation(error="invalid_state")
 
+        state_mean = round(float(x.mean()), 4)
+        state_std = round(float(x.std()), 4)
+
         t0 = time.perf_counter()
         try:
             shap_vals = self._explainer.shap_values(
@@ -260,9 +263,15 @@ class SHAPExplainer:
             )
         except Exception as exc:
             logger.error("SHAPExplainer: shap_values failed: %s", exc)
-            return self._empty_explanation(error="shap_values_failed")
+            elapsed_ms = max(0.01, (time.perf_counter() - t0) * 1000)
+            return self._empty_explanation(
+                error="shap_values_failed",
+                explanation_ms=elapsed_ms,
+                state_mean=state_mean,
+                state_std=state_std,
+            )
 
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+        elapsed_ms = max(0.01, (time.perf_counter() - t0) * 1000)
 
         # KernelExplainer may return list or ndarray depending on SHAP version.
         try:
@@ -272,7 +281,12 @@ class SHAPExplainer:
                 vals = np.array(shap_vals, dtype=np.float32).reshape(-1)
         except Exception as exc:
             logger.error("SHAPExplainer: failed to parse shap values: %s", exc)
-            return self._empty_explanation(error="shap_parse_failed")
+            return self._empty_explanation(
+                error="shap_parse_failed",
+                explanation_ms=elapsed_ms,
+                state_mean=state_mean,
+                state_std=state_std,
+            )
 
         try:
             expected_value = self._explainer.expected_value
@@ -337,8 +351,8 @@ class SHAPExplainer:
             "top_positive": top_positive,
             "top_negative": top_negative,
             "explanation_ms": round(elapsed_ms, 2),
-            "state_mean": round(float(x.mean()), 4),
-            "state_std": round(float(x.std()), 4),
+            "state_mean": state_mean,
+            "state_std": state_std,
         }
 
     def get_feature_names(self) -> List[str]:
@@ -404,15 +418,20 @@ class SHAPExplainer:
             self._explainer = None
 
     @staticmethod
-    def _empty_explanation(error: str = "explainer_not_ready") -> Dict:
+    def _empty_explanation(
+        error: str = "explainer_not_ready",
+        explanation_ms: float = 0.0,
+        state_mean: float = 0.0,
+        state_std: float = 0.0,
+    ) -> Dict:
         return {
             "top_drivers": [],
             "base_value": 0.0,
             "shap_values": {},
             "top_positive": [],
             "top_negative": [],
-            "explanation_ms": 0.0,
-            "state_mean": 0.0,
-            "state_std": 0.0,
+            "explanation_ms": round(float(explanation_ms), 2),
+            "state_mean": state_mean,
+            "state_std": state_std,
             "error": error,
         }
