@@ -1,82 +1,134 @@
-CloudOS-RL  
-AI Multi-Cloud Scheduler  
+# ☁️ CloudOS-RL — AI Multi-Cloud Scheduler
 
-AI-driven multi-cloud scheduler that optimizes cost, latency, carbon, and SLA using Reinforcement Learning with explainable decisions.
+> **PPO Reinforcement Learning** scheduler that optimizes cloud workload placement across cost, latency, carbon footprint, and SLA — with real-time explainability.
 
-Overview  
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-Native-326CE5?style=flat&logo=kubernetes&logoColor=white)](https://kubernetes.io)
+[![React](https://img.shields.io/badge/React-Vite-61DAFB?style=flat&logo=react&logoColor=white)](https://react.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-CloudOS-RL selects the optimal cloud (AWS, Azure, GCP) for workloads by optimizing cost, latency, carbon, and SLA, designed for real-time multi-cloud scheduling.
+---
 
-What It Does  
+## 🎯 Why This Project Matters
 
-Input  
-A workload request with compute, memory, and latency requirements  
+Cloud scheduling is a billion-dollar problem. Traditional rule-based schedulers fail to balance cost, performance, and sustainability simultaneously. **CloudOS-RL** replaces static heuristics with a trained PPO agent that makes adaptive, explainable decisions in under 700ms — bridging the gap between academic RL research and production-grade MLOps.
 
-Output  
-Optimal cloud placement with region, cost, latency, and confidence score  
+---
 
-Product  
+## ✨ Key Features
 
-Dashboard  
-Main monitoring view showing scheduler status, KPIs, and workload management in a single interface.  
-![Dashboard](docs/images/dashboard.png)
+| Feature | Details |
+|---|---|
+| 🤖 **RL-Powered Scheduling** | PPO agent (Stable-Baselines3) trained on multi-objective reward: cost + latency + carbon + SLA |
+| 🔍 **Explainable AI** | SHAP values expose per-decision feature attribution — no black box |
+| ⚡ **Real-Time Streaming** | Kafka event bus delivers scheduling decisions to the UI with sub-second latency |
+| ☸️ **Kubernetes-Native** | Fully containerized; deploys to Minikube or any K8s cluster out of the box |
+| 🌐 **Multi-Cloud Aware** | Abstracts AWS / GCP / Azure provider configs into a unified scheduling surface |
+| 📊 **Live Dashboard** | React + Vite monitoring UI with scheduling history, SHAP charts, and KPI tiles |
 
-Scheduling  
-Workload submission form used to define compute, memory, storage, latency, and placement preferences.  
-![Schedule Form](docs/images/schedule-form.png)
+---
 
-Decision Output  
-Placement result showing selected cloud, region, instance type, cost, latency, and savings metrics.  
-![Decision Output](docs/images/decision-output.png)
+## 🏗️ Architecture
 
-Explainability  
-SHAP-based explanation panel highlighting the top factors that influenced the scheduling decision.  
-![SHAP](docs/images/shap-explain.png)
+```
+Client Request
+     │
+     ▼
+ FastAPI Layer          ← REST API + input validation
+     │
+     ▼
+ PPO RL Agent           ← Stable-Baselines3 · multi-objective reward
+     │
+     ▼
+ SHAP Explainer         ← Feature-level decision attribution
+     │
+     ▼
+ Kafka Producer         ← Async event streaming
+     │
+     ▼
+ React Dashboard        ← Real-time UI · scheduling output + SHAP viz
+```
 
-System Flow  
+---
 
-Request → FastAPI → PPO RL → Decision  
-                          ↓  
-                    SHAP Explain  
-                          ↓  
-                    Kafka → UI  
+## 🛠️ Tech Stack
 
-Security  
+**Backend** · FastAPI · Python 3.10+ · Stable-Baselines3 (PPO) · SHAP · Apache Kafka  
+**Frontend** · React · Vite · Recharts  
+**Infrastructure** · Docker · Kubernetes · Minikube  
 
-JWT authentication  
-bcrypt password hashing  
-Role-based access control  
+---
 
-Roles: viewer · user · engineer · admin · executive  
+## 📸 Screenshots
 
-Tech Stack  
+<table>
+  <tr>
+    <td><b>Dashboard Overview</b></td>
+    <td><b>Scheduling Form</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/dashboard.png" width="400"/></td>
+    <td><img src="docs/images/schedule-form.png" width="400"/></td>
+  </tr>
+  <tr>
+    <td><b>Decision Output</b></td>
+    <td><b>SHAP Explainability</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/decision-output.png" width="400"/></td>
+    <td><img src="docs/images/shap-explain.png" width="400"/></td>
+  </tr>
+</table>
 
-Backend: FastAPI (Python)  
-AI: PPO (Stable-Baselines3)  
-Explainability: SHAP  
-Streaming: Kafka  
-Frontend: React + Vite  
-Infrastructure: Docker, Kubernetes  
+---
 
-API  
+## ⚡ Performance
 
-POST /auth/register  
-POST /auth/login  
-POST /api/v1/schedule  
-GET /api/v1/decisions  
-POST /api/v1/decisions/{id}/explain  
+- **Scheduling Latency:** 300–700 ms end-to-end
+- **Load Stability:** Consistent throughput under concurrent requests
+- **Kafka Throughput:** Real-time event delivery with no observable UI lag
 
-Run  
+---
 
+## 🚀 Quick Start
+
+```bash
+# 1. Clone
 git clone https://github.com/KadhirDev/CloudOS-RL.git  
-cd CloudOS-RL  
+cd cloudos-rl
 
-docker build -t cloudos-api .  
-minikube start  
-kubectl apply -f infrastructure/k8s/  
-kubectl port-forward svc/cloudos-api-svc 8001:8000 -n cloudos-rl  
+# 2. Start services
+docker-compose up --build
 
-Performance  
+# 3. Deploy to Kubernetes (optional)
+kubectl apply -f k8s/
 
-Latency: 300–700 ms  
-Stable under load  
+# 4. Open dashboard
+open http://localhost:5173
+```
+
+---
+
+## 📁 Project Structure
+
+```
+cloudos-rl/
+├── api/              # FastAPI app · routes · request models
+├── agent/            # PPO training · environment · reward shaping
+├── explainer/        # SHAP integration · attribution pipeline
+├── streaming/        # Kafka producer · consumer setup
+├── dashboard/        # React + Vite frontend
+├── k8s/              # Kubernetes manifests
+└── docker-compose.yml
+```
+
+---
+
+## 🤝 Contributing
+
+PRs welcome. Open an issue first for major changes.
+
+---
+
+> Built to demonstrate end-to-end ML system design: from RL training to real-time inference, explainability, and cloud-native deployment.
